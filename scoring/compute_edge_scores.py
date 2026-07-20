@@ -5,16 +5,24 @@ routes to the correct position's feature builder + points calculator,
 computes percentile-rank Edge scores within each position group, and writes
 results to edge_scores with factor_breakdown populated.
 
-NOTE: player_game_stats is currently empty (season hasn't started / no
-backfill yet). The JSONB stat key names assumed below (pass_attempts,
-rush_yards, etc.) are placeholders based on common naming conventions and
-WILL need verification/adjustment once real data is loaded via the Phase 3.6
-backfill. This file is untested end-to-end until that data exists.
+Stat key names below were reconciled against the REAL nflverse keys written
+by pipeline/backfill_player_game_stats_2025.py (Step 3) -- verified directly
+against `player_game_stats.stats` in the database, not guessed. Two stats
+that don't exist as raw nflverse columns (`rush_share`, `adot`) are derived
+here instead:
+  - rush_share = this player's carries ÷ their team's total carries that
+    game. Team totals are read from the TEAM's own DEF row for the same
+    game_id, since a DEF row is that team's full box score (see gotcha #4
+    in PROJECT_LOG.md / dst_features.py's docstring).
+  - adot = receiving_air_yards ÷ targets, per game (no team lookup needed).
+The same "DEF row = team box score" trick also replaces the old hardcoded
+26.0/34.0 team-volume placeholders with real EWMA'd team baselines.
 """
 
 from datetime import datetime, timezone, timedelta
 
 from config.supabase_client import get_supabase_client
+from scoring.stats_utils import ewma
 from scoring.vegas_features import get_game_row, team_implied_total, team_spread
 from scoring.qb_features import build_qb_features
 from scoring.rb_features import build_rb_features
@@ -28,6 +36,10 @@ from scoring.points_calculator import (
 
 NUM_HISTORY_GAMES = 5
 LEAGUE_AVG_IMPLIED_TOTAL = 22.0
+
+# Fallbacks used only when a team has no DEF-row history yet (e.g. week 1).
+DEFAULT_TEAM_RUSH_ATTEMPTS_BASELINE = 26.0
+DEFAULT_TEAM_PASS_ATTEMPTS_BASELINE = 34.0
 
 
 def _get_upcoming_game(client, team_id: str) -> dict | None:
@@ -47,10 +59,15 @@ def _get_upcoming_game(client, team_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
-def _get_stat_history(client, player_id: str, keys: list[str], n: int = NUM_HISTORY_GAMES) -> dict:
+def _get_stat_history(
+    client, player_id: str, keys: list[str], n: int = NUM_HISTORY_GAMES
+) -> tuple[dict, list[str]]:
     """
     Fetch the player's last n games' stats (JSONB), oldest-first, and extract
-    the requested keys into parallel lists. Missing keys default to 0.
+    the requested keys into parallel lists. Missing/null keys default to 0.
+    Also returns the aligned list of game_ids (oldest-first), so callers can
+    look up the SAME games' team-level context elsewhere (see
+    _get_stats_by_game_id below).
     """
     result = (
         client.table("player_game_stats")
@@ -62,15 +79,67 @@ def _get_stat_history(client, player_id: str, keys: list[str], n: int = NUM_HIST
     )
     rows = list(reversed(result.data or []))  # oldest-first for EWMA
 
+    game_ids = [row["game_id"] for row in rows]
     history = {key: [] for key in keys}
     for row in rows:
         stats = row.get("stats") or {}
         for key in keys:
-            history[key].append(stats.get(key, 0))
-    return history
+            # `.get(key) or 0` (not `.get(key, 0)`) because several real
+            # nflverse keys are present but explicitly null (e.g. fg_pct with
+            # no attempts) -- both "missing" and "present-but-null" should
+            # default to 0.
+            history[key].append(stats.get(key) or 0)
+    return history, game_ids
 
 
-def compute_player_projection(client, player: dict) -> dict | None:
+def _get_stats_by_game_id(
+    client, player_id: str | None, game_ids: list[str], key: str
+) -> dict[str, float]:
+    """A single stat key for player_id, keyed by game_id, for a specific set of games."""
+    if not player_id or not game_ids:
+        return {}
+    result = (
+        client.table("player_game_stats")
+        .select("game_id, stats")
+        .eq("player_id", player_id)
+        .in_("game_id", game_ids)
+        .execute()
+    )
+    return {row["game_id"]: (row.get("stats") or {}).get(key) or 0 for row in (result.data or [])}
+
+
+def _get_def_player_by_team(client) -> dict[str, str]:
+    """team_id -> DEF player_id, fetched once and reused across all players."""
+    result = (
+        client.table("players")
+        .select("player_id, team_id")
+        .eq("sport", "nfl")
+        .eq("position", "DEF")
+        .execute()
+    )
+    return {row["team_id"]: row["player_id"] for row in (result.data or []) if row.get("team_id")}
+
+
+def _get_team_offense_baseline(
+    client, def_player_id: str | None, n: int = NUM_HISTORY_GAMES, half_life: float = 2.5
+) -> dict[str, float]:
+    """
+    EWMA'd team-level rush/pass attempt volume, read from the team's own DEF
+    row history (which is that team's own full box score -- carries/attempts
+    there are the TEAM's totals, not any individual defender's).
+    """
+    if not def_player_id:
+        return {
+            "carries": DEFAULT_TEAM_RUSH_ATTEMPTS_BASELINE,
+            "attempts": DEFAULT_TEAM_PASS_ATTEMPTS_BASELINE,
+        }
+    hist, _ = _get_stat_history(client, def_player_id, ["carries", "attempts"], n)
+    carries = ewma(hist["carries"], half_life) if hist["carries"] else DEFAULT_TEAM_RUSH_ATTEMPTS_BASELINE
+    attempts = ewma(hist["attempts"], half_life) if hist["attempts"] else DEFAULT_TEAM_PASS_ATTEMPTS_BASELINE
+    return {"carries": carries, "attempts": attempts}
+
+
+def compute_player_projection(client, player: dict, def_player_by_team: dict[str, str]) -> dict | None:
     """
     Routes a player to the correct feature builder + points calculator based
     on position. Returns {"points": float, "features": dict} or None if the
@@ -92,60 +161,106 @@ def compute_player_projection(client, player: dict) -> dict | None:
         return None
 
     if position == "QB":
-        hist = _get_stat_history(client, player["player_id"], [
-            "pass_attempts", "pass_yards", "pass_td", "pass_int",
-            "rush_attempts", "rush_yards",
+        hist, _ = _get_stat_history(client, player["player_id"], [
+            "attempts", "passing_yards", "passing_tds", "passing_interceptions",
+            "carries", "rushing_yards",
         ])
         features = build_qb_features(
-            hist["pass_attempts"], hist["pass_yards"], hist["pass_td"], hist["pass_int"],
-            hist["rush_attempts"], hist["rush_yards"], spread,
+            hist["attempts"], hist["passing_yards"], hist["passing_tds"], hist["passing_interceptions"],
+            hist["carries"], hist["rushing_yards"], spread,
         )
         points = calculate_qb_points(features)
 
     elif position == "RB":
-        hist = _get_stat_history(client, player["player_id"], [
-            "rush_share", "target_share", "rush_yards", "rush_attempts",
-            "rec_yards", "receptions", "targets", "rush_td", "rec_td",
+        hist, game_ids = _get_stat_history(client, player["player_id"], [
+            "carries", "rushing_yards", "receiving_yards", "receptions", "targets",
+            "rushing_tds", "receiving_tds", "target_share",
         ])
-        # Team-level baselines: v1 simplification — use league-average team
-        # volume constants until a dedicated team-level stats aggregator exists.
+
+        def_player_id = def_player_by_team.get(team_id)
+        team_carries_by_game = _get_stats_by_game_id(client, def_player_id, game_ids, "carries")
+        rush_share_history = [
+            (hist["carries"][i] / team_carries_by_game[gid]) if team_carries_by_game.get(gid) else 0.0
+            for i, gid in enumerate(game_ids)
+        ]
+        team_baseline = _get_team_offense_baseline(client, def_player_id)
+
         features = build_rb_features(
-            hist["rush_share"], hist["target_share"], 26.0, 34.0,
-            hist["rush_yards"], hist["rush_attempts"], hist["rec_yards"],
-            hist["receptions"], hist["targets"], hist["rush_td"], hist["rec_td"],
+            rush_share_history, hist["target_share"],
+            team_baseline["carries"], team_baseline["attempts"],
+            hist["rushing_yards"], hist["carries"], hist["receiving_yards"],
+            hist["receptions"], hist["targets"], hist["rushing_tds"], hist["receiving_tds"],
             spread,
         )
         points = calculate_rb_points(features)
 
     elif position in ("WR", "TE"):
-        hist = _get_stat_history(client, player["player_id"], [
-            "target_share", "targets", "receptions", "rec_yards", "rec_td", "adot",
+        hist, _ = _get_stat_history(client, player["player_id"], [
+            "target_share", "targets", "receptions", "receiving_yards",
+            "receiving_tds", "receiving_air_yards",
         ])
+        adot_history = [
+            (hist["receiving_air_yards"][i] / hist["targets"][i]) if hist["targets"][i] else 0.0
+            for i in range(len(hist["targets"]))
+        ]
+
+        def_player_id = def_player_by_team.get(team_id)
+        team_baseline = _get_team_offense_baseline(client, def_player_id)
+
         features = build_wr_te_features(
-            hist["target_share"], 34.0, hist["targets"], hist["receptions"],
-            hist["rec_yards"], hist["rec_td"], hist["adot"], spread,
+            hist["target_share"], team_baseline["attempts"], hist["targets"], hist["receptions"],
+            hist["receiving_yards"], hist["receiving_tds"], adot_history, spread,
         )
         points = calculate_wr_te_points(features)
 
     elif position == "K":
-        hist = _get_stat_history(client, player["player_id"], [
-            "fg_attempts", "fg_made", "pat_attempts",
-        ])
+        hist, _ = _get_stat_history(client, player["player_id"], ["fg_att", "fg_made", "pat_att"])
         implied = team_implied_total(game, team_id)
         features = build_kicker_features(
-            hist["fg_attempts"], hist["fg_made"], hist["pat_attempts"],
+            hist["fg_att"], hist["fg_made"], hist["pat_att"],
             implied, LEAGUE_AVG_IMPLIED_TOTAL,
         )
         points = calculate_kicker_points(features)
 
     elif position == "DEF":
         opp_implied = team_implied_total(game, opponent_id)
-        hist = _get_stat_history(client, player["player_id"], [
-            "sack_rate", "opponent_sack_rate_allowed", "opponent_turnovers", "opponent_plays",
+
+        own_hist, _ = _get_stat_history(client, player["player_id"], [
+            "def_sacks", "def_interceptions", "fumble_recovery_opp",
+            "def_fumbles_forced", "def_tds", "special_teams_tds", "def_safeties",
         ])
+        own_takeaways_history = [
+            own_hist["def_interceptions"][i] + own_hist["fumble_recovery_opp"][i]
+            for i in range(len(own_hist["def_interceptions"]))
+        ]
+        own_def_st_tds_history = [
+            own_hist["def_tds"][i] + own_hist["special_teams_tds"][i]
+            for i in range(len(own_hist["def_tds"]))
+        ]
+
+        opponent_def_player_id = def_player_by_team.get(opponent_id)
+        if opponent_def_player_id:
+            opp_hist, _ = _get_stat_history(client, opponent_def_player_id, [
+                "sacks_suffered", "passing_interceptions", "fumbles_lost_total",
+                "passing_yards", "rushing_yards",
+            ])
+            opp_sacks_suffered_history = opp_hist["sacks_suffered"]
+            opp_giveaways_history = [
+                opp_hist["passing_interceptions"][i] + opp_hist["fumbles_lost_total"][i]
+                for i in range(len(opp_hist["passing_interceptions"]))
+            ]
+            opp_yards_history = [
+                opp_hist["passing_yards"][i] + opp_hist["rushing_yards"][i]
+                for i in range(len(opp_hist["passing_yards"]))
+            ]
+        else:
+            opp_sacks_suffered_history, opp_giveaways_history, opp_yards_history = [], [], []
+
         features = build_dst_features(
-            opp_implied, hist["sack_rate"], hist["opponent_sack_rate_allowed"],
-            hist["opponent_turnovers"], hist["opponent_plays"], 340.0,
+            opp_implied,
+            own_hist["def_sacks"], own_takeaways_history, own_hist["def_fumbles_forced"],
+            own_def_st_tds_history, own_hist["def_safeties"],
+            opp_sacks_suffered_history, opp_giveaways_history, opp_yards_history,
         )
         points = calculate_dst_points(features)
 
@@ -161,10 +276,12 @@ def compute_and_write_edge_scores(period: str = "week1") -> None:
     players_result = client.table("players").select("*").eq("sport", "nfl").execute()
     players = players_result.data or []
 
+    def_player_by_team = _get_def_player_by_team(client)
+
     # Compute raw points for every player first (needed for percentile ranking)
     projections = {}  # player_id -> {points, features, game_id, position}
     for player in players:
-        proj = compute_player_projection(client, player)
+        proj = compute_player_projection(client, player, def_player_by_team)
         if proj:
             proj["position"] = player["position"]
             projections[player["player_id"]] = proj

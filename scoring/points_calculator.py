@@ -84,27 +84,27 @@ def calculate_kicker_points(kicker_features: dict) -> float:
 def calculate_dst_points(dst_features: dict) -> float:
     r = RULES["dst"]
 
-    # v1 simplification: sack_matchup and opponent_turnover_worthy_rate feed
-    # points_allowed/yards_allowed tier estimation indirectly via the implied
-    # total and yards-allowed input — direct sack/turnover counts need a
-    # separate projected-plays multiplier, which is a reasonable v2 refinement.
-    # For v1, project points_allowed from opponent_implied_total directly
-    # (rounding to nearest tier), and yards_allowed from the passed-in baseline.
-
+    # points_allowed comes straight from the Vegas implied total (unchanged
+    # from the original design); yards_allowed uses the opponent's own
+    # recent-offense proxy computed in build_dst_features. Everything else
+    # below is now a real EWMA'd count of this defense's own production
+    # (see scoring/dst_features.py's module docstring for exactly which
+    # nflverse keys back each of these, and which ones were deliberately
+    # excluded to avoid double-counting).
     points_allowed_est = dst_features["opponent_implied_total"]
-    yards_allowed_est = dst_features["opponent_yards_allowed_tier_input"]
+    yards_allowed_est = dst_features["opponent_yards_allowed_proxy"]
 
     points = tiered_points(points_allowed_est, r["points_allowed_tiers"])
     points += tiered_points(yards_allowed_est, r["yards_allowed_tiers"])
 
-    # Approximate takeaway/sack contribution using the shrinkage-regressed
-    # turnover rate and sack_matchup as expected-value multipliers against a
-    # reasonable per-game opponent-play-count assumption (65 plays, v1 default).
-    assumed_opponent_plays = 65
-    expected_turnovers = dst_features["opponent_turnover_worthy_rate"] * assumed_opponent_plays
-    expected_sacks = dst_features["sack_matchup"] * assumed_opponent_plays
-
-    points += expected_turnovers * r["interception"]  # treating turnovers as INT-equivalent value, v1 simplification
-    points += expected_sacks * r["sack"]
+    points += dst_features["proj_sacks"] * r["sack"]
+    # proj_takeaways blends interceptions + opponent-fumble recoveries; both
+    # are worth 2 pts in our league rules, so scoring the blend at the
+    # "interception" rate (== "fumble_recovery" rate) is exact, not a v1
+    # approximation.
+    points += dst_features["proj_takeaways"] * r["interception"]
+    points += dst_features["proj_forced_fumbles"] * r["forced_fumble"]
+    points += dst_features["proj_def_st_tds"] * r["touchdown"]
+    points += dst_features["proj_safeties"] * r["safety"]
 
     return points
