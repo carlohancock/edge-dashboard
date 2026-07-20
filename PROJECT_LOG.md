@@ -272,11 +272,31 @@ the real backfilled data actually uses.
 
 ---
 
+## Phase 4.9 — historical game lookup fixed + non-vegas backtest run (offense+K)
+
+**Fix (permanent, committed):** `_get_upcoming_game` only ever supported live (future) scoring — no way to target a past season/week, which blocked backtesting entirely. Added `_get_game_for_period(client, team_id, season, week)` alongside it in `compute_edge_scores.py`, and threaded real `season`/`week` params through `compute_player_projection` and `compute_and_write_edge_scores`. Both now pick the lookup function based on whether season+week are given; `period` remains a display label only, never a game-selection input. VERIFIED against Justin Jefferson (non-traded) 2025 Wk12: returned game = MIN @ GB, cross-checked independently against the `team_id`/`opponent_team_id` backfilled in 4.8 (agreement across two separate data paths).
+
+**Backtest (throwaway script, deleted after use):** validated the opportunity/efficiency/shrinkage half of the formula (EWMA volume, regressed TD/INT rates, team-baseline share math) for QB/RB/WR/TE/K against real 2025 games, weeks 6–12, using the new `_get_game_for_period`. This executes PARKED NOTE 1's option (b) — game_script and the kicker's implied-total scoring factor were explicitly neutralized (`team_spread=None`, kicker scoring_factor forced to 1.0), not computed, since 2025 has zero odds data. DST out of scope. Leakage-safe: all history (model EWMA input AND the naive baseline) was fetched with an explicit `game_time <` cutoff at the test week, never crossing into or past it. Sample: 192 current-depth-chart starters (32 QB/RB/TE/K, 64 WR at rank ≤2) — a modest test sample, not the full player pool; note this reused each player's *current* team_id to find the week's game, so it inherits the not-yet-fixed 4.8-vs-4.9 wiring gap for any (rare) traded player in the sample. 778 evaluable player-weeks.
+
+**Results — MAE, model vs. naive (last-3-game trailing average):**
+
+| Position | n | Model MAE | Naive MAE | Model beats naive? |
+|---|---|---|---|---|
+| QB | 135 | 6.11 | 6.62 | Yes |
+| RB | 148 | 7.59 | 7.98 | Yes |
+| WR | 222 | 6.67 | 6.92 | Yes |
+| TE | 148 | 5.98 | 6.45 | Yes |
+| K | 125 | 4.45 | 4.44 | **No** — essentially a dead heat |
+
+**Read:** QB/RB/WR/TE all beat the naive baseline on opportunity/efficiency alone, before game-script or matchup adjustments are even added — a reasonable signal the shrinkage/EWMA core is sound. Kicker does NOT beat naive (4.45 vs 4.44) — expected, since the kicker feature builder's only non-vegas lever is FG/PAT volume EWMA scaled by a scoring_factor that's forced to 1.0 here, i.e. almost the same computation as the naive average; the real differentiator (implied-total scaling) is exactly the piece disabled for this test, so this is not a formula red flag, just confirmation that kicker genuinely needs the vegas signal to differentiate from a trailing average. Spot-checked individual rows (2 per position) showed the expected pattern: routine games tracked reasonably (e.g. kicker/QB diffs in the 0.5–5pt range), while a few boom weeks (RB Wk8, TE Wk7) produced large misses on BOTH model and naive — expected variance from touchdown-rate randomness a 5-game EWMA can't predict, not a bug.
+
+---
+
 ## STILL AHEAD (Phase 4 remaining, then onward — order matters)
 
-1. **Wire scoring engine to per-game team columns.** Switch `compute_edge_scores.py` (rush_share resolution + any team-relative lookup) to read `player_game_stats.team_id` / `opponent_team_id` instead of `players.team_id`. Prerequisite for the backtest — otherwise compute-time team resolution re-introduces the bug the 4.8 data fix just removed.
-2. **2025-odds decision (OWED — my call to make).** Resolve PARKED NOTE 1 above: backfill historical odds (a), backtest odds-free with game-script excluded (b), or validate live on 2026 (c). Gates the backtest; no code until decided.
-3. **Real leakage-safe backtest (Option A).** Requires (1) and (2) done, PLUS an explicit as-of time boundary so history is cut off at the target week (the leakage guard — no future weeks feeding a past projection). This is the step that finally compares model output vs. actual league points, per-position.
+1. **Wire scoring engine to per-game team columns.** Switch `compute_edge_scores.py` (rush_share resolution + any team-relative lookup, AND the season/week backtest path added in 4.9) to read `player_game_stats.team_id` / `opponent_team_id` instead of `players.team_id`. Needed for a fully correct backtest — otherwise compute-time team resolution re-introduces the bug the 4.8 data fix removed, for any traded player.
+2. **2025-odds decision remainder.** Option (b) (odds-free backtest) is now executed for QB/RB/WR/TE/K — see 4.9 results above. Still open: whether to (a) backfill 2025 historical odds to also validate game-script/market-blend/kicker-implied-total against real 2025 data, or (c) defer that validation to live 2026 odds. No code until decided.
+3. **Full leakage-safe backtest, vegas included.** Requires (1) done and (2) resolved. 4.9's non-vegas backtest is a real but partial leakage-safe backtest (proves the harness + opportunity/efficiency math); the game-script/market-blend half is still unvalidated.
 4. **DST review** (independent of the above): fumble_recovery_tds undercount question + blocked-kicks skip decision — resolve against league_scoring_rules.md.
 5. **THEN Phase 4 is genuinely done → Lovable frontend**, then EdgeGM, automation, deploy.
 
