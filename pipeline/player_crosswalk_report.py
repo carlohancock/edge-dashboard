@@ -11,24 +11,14 @@ actual stats.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import Any
 
-# Fix a common macOS python.org SSL issue (missing local CA bundle) before
-# nfl_data_py/pandas make any HTTPS requests. Must happen before those
-# imports touch the network.
-import certifi
-
-os.environ.setdefault("SSL_CERT_FILE", certifi.where())
-os.environ.setdefault("SSL_CERT_DIR", os.path.dirname(certifi.where()))
-
-import nfl_data_py as nfl  # noqa: E402
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.supabase_client import get_supabase_client  # noqa: E402
+from pipeline.nflverse_crosswalk import build_sleeper_to_gsis_lookup  # noqa: E402
 
 PAGE_SIZE = 1000
 
@@ -86,32 +76,6 @@ def _is_contributor(player: dict[str, Any]) -> bool:
     return depth_chart_rank in CONTRIBUTOR_DEPTH_CHART_RANKS or status == CONTRIBUTOR_STATUS
 
 
-def _build_sleeper_to_gsis_lookup() -> dict[str, dict[str, Any]]:
-    """sleeper_id (str) -> {gsis_id, pfr_id, name} from nflverse's crosswalk."""
-    crosswalk = nfl.import_ids(columns=["sleeper_id", "gsis_id", "pfr_id", "name"])
-    crosswalk = crosswalk[crosswalk["sleeper_id"].notna()].copy()
-
-    # sleeper_id arrives as a float (e.g. 13269.0); normalize to the same
-    # string form Sleeper/our players table uses ("13269").
-    crosswalk["sleeper_id"] = crosswalk["sleeper_id"].apply(lambda x: str(int(x)))
-
-    # A handful of retired/obscure players share a sleeper_id in this dataset
-    # (data-quality quirk upstream, not ours). Prefer the row that actually
-    # has a gsis_id so Step 3's join has something usable.
-    crosswalk["has_gsis"] = crosswalk["gsis_id"].notna()
-    crosswalk = crosswalk.sort_values("has_gsis", ascending=False)
-    crosswalk = crosswalk.drop_duplicates(subset="sleeper_id", keep="first")
-
-    lookup: dict[str, dict[str, Any]] = {}
-    for row in crosswalk.itertuples(index=False):
-        lookup[row.sleeper_id] = {
-            "gsis_id": row.gsis_id if isinstance(row.gsis_id, str) else None,
-            "pfr_id": row.pfr_id if isinstance(row.pfr_id, str) else None,
-            "nflverse_name": row.name,
-        }
-    return lookup
-
-
 def build_crosswalk_report() -> None:
     client = get_supabase_client()
 
@@ -121,7 +85,7 @@ def build_crosswalk_report() -> None:
     print(f"Fetched {len(players)} players (sport=nfl).")
 
     print("Fetching nflverse ID crosswalk (nfl_data_py.import_ids())...")
-    sleeper_to_gsis = _build_sleeper_to_gsis_lookup()
+    sleeper_to_gsis = build_sleeper_to_gsis_lookup()
     print(f"Crosswalk has {len(sleeper_to_gsis)} unique sleeper_id entries.\n")
 
     matched: list[dict[str, Any]] = []
