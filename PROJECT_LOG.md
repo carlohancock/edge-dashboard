@@ -234,98 +234,52 @@ conventions and will need verification/adjustment against whatever schema
 the real backfilled data actually uses.
 - **## Phase 4.6 — scoring engine key reconciliation (offense COMPLETE, DST pending review)** - Reconciled compute_edge_[scores.py](http://scores.py) placeholder keys → real nflverse keys. Straight renames (pass_attempts→attempts, rush_yards→rushing_yards, etc.), derived adot (receiving_air_yards/targets) and rush_share (player carries ÷ team carries off the team's DEF-row box score), replaced hardcoded team-volume baselines with real EWMA'd values via same DEF-row trick. - VERIFIED: DEF-row carry total = sum of nflverse player carries (5/5 team-weeks at source). rush_share denominator is sound. - OFFENSE RANKINGS PLAUSIBLE (2025 Wk12 read-only test): RB/WR lists football-credible (McCaffrey/Gibbs/Brown; JSN/London/Pickens up top, no backups over starters). Engine works end-to-end on real data. NOT YET WRITTEN to edge_scores — read-only test only.
 
-**## Phase 4.7 — edge_scores write path proven (plumbing test COMPLETE)**
+## Phase 4.7 — edge_scores write path proven (plumbing test COMPLETE)
 
-**Goal (deliberately narrow): confirm the edge_scores WRITE PATH works — upsert**
-
-**lands, dedup holds, factor_breakdown populates. NOT a model-validation step; NOT a**
-
-**backtest. Numbers intentionally throwaway.**
+**Goal (deliberately narrow):** confirm the edge_scores WRITE PATH works — upsert lands, dedup holds, factor_breakdown populates. NOT model validation; NOT a backtest. Numbers intentionally throwaway.
 
 **What was done:**
 
-**- Added** `UNIQUE (player_id, score_type, period)` **constraint to edge_scores**
+- Added `UNIQUE (player_id, score_type, period)` constraint to edge_scores (`edge_scores_player_score_period_uniq`) — required by the existing upsert's `on_conflict` clause, and correct long-term design for every real write. Permanent (kept, not rolled back).
+- Ran a throwaway script (`_tmp_plumbing_test_wk12.py`, since deleted) reusing the real feature builders / points calculators but selecting 2025 Wk12 games, writing under `period='2025-WK12-TEST'`.
+- Result: 813 offense rows (QB 113 / RB 173 / WR 342 / TE 185). total_rows == distinct_keys == 813 (upsert dedup verified, not incidental). factor_breakdown confirmed as real populated JSONB on every row. Position routing/join clean (no position bleed). Rows eyeballed, then DELETED — edge_scores back to 0 for that period. Throwaway script deleted.
 
-  ****`edge_scores_player_score_period_uniq`**) — required by the existing upsert's**
+**CONCLUSION: the edge_scores write path works end-to-end on real data.** This had NEVER been exercised before — prior Phase 4.6 "offense complete" was READ-ONLY only.
 
-  ****`on_conflict` **clause, and correct long-term design for every real write. This is**
+**Note on prior parked notes:** none of the Phase 4.6 parked notes were resolved in this step — scope was held to the write-path test only. (team_id drift resolved separately in 4.8 below; QB volume artifact and DST review remain open.)
 
-  **now permanent (kept, not rolled back).**
+### PARKED NOTES (from this session)
 
-**- Ran a throwaway script** `_tmp_plumbing_test_wk12.py`**, since deleted) that reused**
+1. **2025 season has stats but ZERO odds.** All 2025 games have null implied_home_score / implied_away_score / game_total (0 of ~272). Every game-script-dependent feature is uncomputable for 2025 — `team_spread` returns None and projections die at the spread gate. The plumbing test only produced rows by injecting neutral `spread=0.0` (hence `game_script:0` on every row — known artifact, not a bug). **This is the gating decision for the real backtest:** either (a) backfill 2025 historical odds, (b) run the backtest on odds-independent features only and document game-script as excluded, or (c) skip 2025 backtesting and validate live once 2026 provides real odds. DECISION OWED before any backtest — do not default it.
+2. **Neutral-spread QB volume artifact reconfirmed.** With game_script zeroed, top QBs were Stafford/Lawrence/Goff (high-volume passers), no Mahomes/Allen — same volume-weighting pattern parked in 4.6 (Brissett/Flacco), now compounded by zeroed game-script. Expected behavior of an uncalibrated, odds-less, leaky run. Resolution waits on Phase 5 regression calibration. Not a new issue.
 
-  **the real feature builders / points calculators but selected 2025 Wk12 games and**
+---
 
-  **wrote under** `period='2025-WK12-TEST'`**.**
+## Phase 4.8 — historical team resolution fixed (team_id landmine DEFUSED)
 
-**- Result: 813 offense rows (QB 113 / RB 173 / WR 342 / TE 185). total_rows ==**
+**Root cause:** the 2025 backfill dropped nflverse's per-game `team`/`opponent_team` columns (they were listed in the metadata-exclusion sets), so nothing recorded which team a player was on for a given game. That forced any historical team lookup onto the static current `players.team_id` — wrong for players traded mid-season (the Flacco-showed-as-CIN-in-a-CLE-game bug).
 
-  **distinct_keys == 813 (upsert dedup verified, not incidental). factor_breakdown**
+**Fix:**
 
-  **confirmed as real populated JSONB on every row. Position routing/join clean**
+- Added `team_id` + `opponent_team_id` columns (FK → teams) to `player_game_stats`.
+- Backfilled all 6,405 existing rows (SKILL 5,861 + DEF 544) from nflverse's per-game team/opponent, resolved via the existing team-abbreviation map. 0 unmapped own-team, 0 unmapped opponent. stats JSONB left untouched.
+- VERIFIED against the known trade case: Flacco 2025 Wk1 → CLE, Wk12 → post-trade team; opponent_team_id correct both games.
+- **Prior parked note (team_id drift) is now RESOLVED at the data layer.**
 
-  **(no position bleed). Rows eyeballed, then DELETED — edge_scores back to 0 rows**
+**TECH DEBT (note, not blocker):** the existing-row update path is row-by-row (~6,405 sequential REST calls) — progressively slow and buffered/silent when backgrounded. If this backfill is ever re-run (e.g. for NHL, or a re-sync), batch it via a single upsert and add unbuffered/`flush=True` progress output. Fine as a one-time cost; not worth re-running now.
 
-  **for that period. Throwaway script deleted.**
+**IMPORTANT — not yet done:** the scoring engine does NOT yet READ these new columns. `compute_edge_scores.py` still resolves team via `def_player_by_team[players.team_id]` (current team), so the rush_share DEF-row trick and any team-relative lookup still step on the old landmine at compute time even though the data is now correct. Wiring the engine to use per-game `team_id`/`opponent_team_id` is the next step, and a prerequisite for a trustworthy backtest.
 
-****CONCLUSION: the edge_scores write path (upsert + factor_breakdown + percentile**
+---
 
-**rank + positional_rank) works end-to-end on real data.** This had NEVER been**
+## STILL AHEAD (Phase 4 remaining, then onward — order matters)
 
-**exercised before — prior Phase 4.6 "offense complete" was a READ-ONLY test.**
+1. **Wire scoring engine to per-game team columns.** Switch `compute_edge_scores.py` (rush_share resolution + any team-relative lookup) to read `player_game_stats.team_id` / `opponent_team_id` instead of `players.team_id`. Prerequisite for the backtest — otherwise compute-time team resolution re-introduces the bug the 4.8 data fix just removed.
+2. **2025-odds decision (OWED — my call to make).** Resolve PARKED NOTE 1 above: backfill historical odds (a), backtest odds-free with game-script excluded (b), or validate live on 2026 (c). Gates the backtest; no code until decided.
+3. **Real leakage-safe backtest (Option A).** Requires (1) and (2) done, PLUS an explicit as-of time boundary so history is cut off at the target week (the leakage guard — no future weeks feeding a past projection). This is the step that finally compares model output vs. actual league points, per-position.
+4. **DST review** (independent of the above): fumble_recovery_tds undercount question + blocked-kicks skip decision — resolve against league_scoring_rules.md.
+5. **THEN Phase 4 is genuinely done → Lovable frontend**, then EdgeGM, automation, deploy.
 
-**### PARKED NOTES (new, from this session — both gate the real backtest, neither is a blocker now)**
+---
 
-**1. 2025 season has stats but ZERO odds. All 2025 games have null**
-
-   **implied_home_score / implied_away_score / game_total (0 of ~272). Consequence:**
-
-   **every game-script-dependent feature is uncomputable for 2025 —** `team_spread`
-
-   **returns None and projections die at the spread gate. The plumbing test only**
-
-   **produced rows by injecting a neutral** `spread=0.0` **fallback (hence** `game_script:0`
-
-   **on every row — a known artifact, not a bug). **This is the gating decision for**
-
-   **the real backtest (Option A):** either (a) backfill 2025 historical odds, (b)**
-
-   **run the backtest on odds-independent features only and document game-script as**
-
-   **excluded, or (c) skip 2025 backtesting and validate live once 2026 provides real**
-
-   **odds. DECISION OWED before any backtest — do not default it.**
-
-**2. Neutral-spread QB volume artifact reconfirmed. With game_script zeroed,**
-
-   **top QBs were Stafford/Lawrence/Goff (high-volume passers), no Mahomes/Allen —**
-
-   **same volume-weighting pattern already parked in Phase 4.6 (Brissett/Flacco),**
-
-   **now compounded by zeroed game-script. Expected behavior of an uncalibrated,**
-
-   **odds-less, leakage-present run. Not a new issue; folded into the existing**
-
-   **calibration expectation.**
-
-**### STILL AHEAD (unchanged order, all deferred on purpose)**
-
-**1. team_id historical-join bug (Flacco-as-CIN landmine) — own step.**
-
-**2. Real leakage-safe backtest (Option A) — needs as-of time boundary built AND the**
-
-   **2025-odds decision above resolved.**
-
-**3. DST review (fumble_recovery_tds undercount + blocked-kicks skip).**
-
-**4. THEN Phase 4 genuinely done → Lovable frontend.**
-
-When ready to draft resume bullets, paste the relevant phase(s) above back into a
-
-chat along with target audience (e.g., quant/finance roles — avoid naming specific
-
-languages/tools like SQL, Python, JSON as the headline; foreground the statistical
-
-methods, self-directed scope, and forecasting/decision-framework angle instead) and
-
-we'll simplify/reframe from this source material.
+**Resume-bullet reminder:** when ready, paste the relevant phase(s) above + target audience (quant/finance — foreground statistical methods, self-directed scope, and the forecasting/decision-framework angle; avoid leading with SQL/Python/JSON as tools) and we'll simplify/reframe from this source material.
