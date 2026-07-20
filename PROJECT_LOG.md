@@ -167,78 +167,80 @@ quota — daily game-line fetches are cheap (~1 request regardless of game count
   reported the *count found before deletion*, not a verified delete count. Rootcause: a stale prior-season (2025) dataset silently persisted alongside newlyinserted 2026 data after a reseed, discovered via a `group by extract(year fromgame_time)` diagnostic query showing a mixed 2025/2026 dataset instead of aclean single season. Resolved via a manual, verified table wipe plus fixing thescript's reporting to reflect actual delete confirmation, not a pre-delete count.
   - Odds-matching script failed to match any games post-reseed due to the above  
   stale-data issue (not a logic bug in the matcher itself) — confirmed via atemporary structured debug block that printed the exact match query, parameters,and row counts at each step, isolating the failure to bad upstream data ratherthan flawed matching logic.
+  - **## Phase 3.6 — 2025 stat backfill (COMPLETE)** - Added `season` int column to `games` (backfilled existing 272 rows → 2026, NOT NULL). Seeded 272 games for 2025 season (nfl_data_py schedule), bare-integer week format matching 2026 convention. Zero null teams both seasons. - Crosswalk (sleeper_id → nflverse gsis_id): 810/~991 matched (79.2%). 181 real misses verified as fringe/practice-squad/UDFA — NO dc_rank=1 skill starters dropped. 32 DEF expected non-matches (team-level, separate path). Report prints startable-vs-fringe breakdown every run. Residual to monitor on re-run: ~12 (5 kickers incl. NYG double, couple backup QBs, depth TE/WR) — crosswalk lag, not a bug. - Backfilled player_game_stats: 6,405 rows (5,861 skill + 544 DEF), every 2025 game covered, idempotency verified 2 ways. Real nflverse JSONB keys dumped (133 skill / 127 DEF). New files: pipeline/backfill_player_game_stats_[2025.py](http://2025.py), pipeline/nflverse_[crosswalk.py](http://crosswalk.py), pipeline/player_crosswalk_[report.py](http://report.py) (refactored).
+
+
 
 ## Phase 4 — Scoring engine implementation *(complete, pending real-data validation)*
 
 - **[Done, tested]** Config-driven league scoring rules module (`league_scoring_rules.py`) — the
-  league's exact custom ruleset (non-standard rules including return-yardage
-  scoring, fumble-recovery-TD bonus, granular kicker/DST tiers) encoded as a
-  structured lookup table, decoupling scoring-rule changes from scoring-engine logic.
-  Verified via direct dict access (spot-checked passing TD value and DST points-allowed tier).
+league's exact custom ruleset (non-standard rules including return-yardage
+scoring, fumble-recovery-TD bonus, granular kicker/DST tiers) encoded as a
+structured lookup table, decoupling scoring-rule changes from scoring-engine logic.
+Verified via direct dict access (spot-checked passing TD value and DST points-allowed tier).
 - **[Done, tested]** Statistical utility module (`stats_utils.py`): EWMA
-  (parameterized by half-life, not a fixed window), shrinkage regression
-  (`regressed_rate`, generalized beyond just TD rate to any count/attempt-based
-  rate stat), and tiered bonus/point lookup helpers (`bucket_bonus`,
-  `tiered_points`) shared across all position-specific scoring logic. Verified
-  numerically: EWMA correctly overweights recent values vs. flat average;
-  shrinkage regression confirmed by hand against the closed-form posterior-mean
-  calculation `(event_count + k*mean) / (attempt_count + k)`; tier lookups
-  confirmed against known config values.
+(parameterized by half-life, not a fixed window), shrinkage regression
+(`regressed_rate`, generalized beyond just TD rate to any count/attempt-based
+rate stat), and tiered bonus/point lookup helpers (`bucket_bonus`,
+`tiered_points`) shared across all position-specific scoring logic. Verified
+numerically: EWMA correctly overweights recent values vs. flat average;
+shrinkage regression confirmed by hand against the closed-form posterior-mean
+calculation `(event_count + k*mean) / (attempt_count + k)`; tier lookups
+confirmed against known config values.
 - **[Done, tested]** Vegas-derived features module (`vegas_features.py`):
-  derives team implied total and spread from already-ingested de-vig'd game
-  data, computes game-script multiplier. Verified against a real seeded game
-  row — correct sign/magnitude (underdog gives positive game-script).
+derives team implied total and spread from already-ingested de-vig'd game
+data, computes game-script multiplier. Verified against a real seeded game
+row — correct sign/magnitude (underdog gives positive game-script).
 - **[Done, tested]** Position-specific feature builders (`qb_features.py`,
-  `rb_features.py`, `wr_te_features.py`, `kicker_features.py`,
-  `dst_features.py`) — full implementation of the position-specific formulas
-  from edge_formula_nfl.md, including the RB/WR-TE independent rush-share vs.
-  target-share design (validated against the receiving-back/game-script
-  scenario this project was originally motivated by) and shrinkage-regressed
-  TD/turnover rates per position. All verified by hand against synthetic,
-  internally-consistent test inputs — confirmed EWMA recency-weighting,
-  game-script volume shifts, and shrinkage pull-toward-mean all behave
-  correctly and in the expected direction. One real debugging lesson logged
-  here: an early RB test used mutually-inconsistent synthetic inputs (a
-  rush_share history that didn't match the corresponding rush_attempts
-  history), which produced a misleadingly low projection — caught by manual
-  inspection, not an automated check, and corrected by regenerating internally
-  consistent test data. Worth remembering once real data flows in: rush/target
-  share and raw attempt counts must be derived from the same underlying source
-  to stay consistent.
+`rb_features.py`, `wr_te_features.py`, `kicker_features.py`,
+`dst_features.py`) — full implementation of the position-specific formulas
+from edge_formula_nfl.md, including the RB/WR-TE independent rush-share vs.
+target-share design (validated against the receiving-back/game-script
+scenario this project was originally motivated by) and shrinkage-regressed
+TD/turnover rates per position. All verified by hand against synthetic,
+internally-consistent test inputs — confirmed EWMA recency-weighting,
+game-script volume shifts, and shrinkage pull-toward-mean all behave
+correctly and in the expected direction. One real debugging lesson logged
+here: an early RB test used mutually-inconsistent synthetic inputs (a
+rush_share history that didn't match the corresponding rush_attempts
+history), which produced a misleadingly low projection — caught by manual
+inspection, not an automated check, and corrected by regenerating internally
+consistent test data. Worth remembering once real data flows in: rush/target
+share and raw attempt counts must be derived from the same underlying source
+to stay consistent.
 - **[Done, tested]** Points calculator (`points_calculator.py`): converts each
-  position's projected-stats dict into final fantasy points via
-  LEAGUE_SCORING_RULES, using the bucket_bonus/tiered_points helpers. Two
-  documented v1 simplifications: (1) RB/QB rushing big-play TD bonuses
-  (40+/50+ yard) aren't applied to fractional projected TD counts, since bonus
-  tiers are scoring-play-length-based, not expected-count-based — flagged in
-  edge_formula_nfl.md as a known limitation; (2) kicker FG value uses a
-  blended 40-49-yard tier as a proxy in lieu of full distance-mix modeling
-  (also an explicit v1 flag in the formula doc), and DST sack/turnover point
-  contributions are approximated via an assumed opponent-play-count constant
-  rather than a full projected-plays model. All five position calculators
-  tested end-to-end (feature builder to points calculator) with synthetic
-  data, producing realistic point ranges (QB ~18, RB ~17, WR ~15, K ~12,
-  DST ~9).
+position's projected-stats dict into final fantasy points via
+LEAGUE_SCORING_RULES, using the bucket_bonus/tiered_points helpers. Two
+documented v1 simplifications: (1) RB/QB rushing big-play TD bonuses
+(40+/50+ yard) aren't applied to fractional projected TD counts, since bonus
+tiers are scoring-play-length-based, not expected-count-based — flagged in
+edge_formula_nfl.md as a known limitation; (2) kicker FG value uses a
+blended 40-49-yard tier as a proxy in lieu of full distance-mix modeling
+(also an explicit v1 flag in the formula doc), and DST sack/turnover point
+contributions are approximated via an assumed opponent-play-count constant
+rather than a full projected-plays model. All five position calculators
+tested end-to-end (feature builder to points calculator) with synthetic
+data, producing realistic point ranges (QB ~18, RB ~17, WR ~15, K ~12,
+DST ~9).
 - **[Written, untested]** Orchestration layer (`compute_edge_scores.py`):
-  pulls each player's recent stat history plus upcoming game context from the
-  database, routes to the correct position's feature builder and points
-  calculator, computes percentile-rank Edge scores within each position
-  group, and writes results to edge_scores with factor_breakdown populated.
-  Cannot be tested end-to-end until player_game_stats is populated (Phase 3.6
-  backfill) — the JSONB stat key names assumed here (e.g. pass_attempts,
-  rush_yards, target_share) are placeholders based on common naming
-  conventions and will need verification/adjustment against whatever schema
-  the real backfilled data actually uses.
+pulls each player's recent stat history plus upcoming game context from the
+database, routes to the correct position's feature builder and points
+calculator, computes percentile-rank Edge scores within each position
+group, and writes results to edge_scores with factor_breakdown populated.
+Cannot be tested end-to-end until player_game_stats is populated (Phase 3.6
+backfill) — the JSONB stat key names assumed here (e.g. pass_attempts,
+rush_yards, target_share) are placeholders based on common naming
+conventions and will need verification/adjustment against whatever schema
+the real backfilled data actually uses.
+- **## Phase 4.6 — scoring engine key reconciliation (offense COMPLETE, DST pending review)** - Reconciled compute_edge_[scores.py](http://scores.py) placeholder keys → real nflverse keys. Straight renames (pass_attempts→attempts, rush_yards→rushing_yards, etc.), derived adot (receiving_air_yards/targets) and rush_share (player carries ÷ team carries off the team's DEF-row box score), replaced hardcoded team-volume baselines with real EWMA'd values via same DEF-row trick. - VERIFIED: DEF-row carry total = sum of nflverse player carries (5/5 team-weeks at source). rush_share denominator is sound. - OFFENSE RANKINGS PLAUSIBLE (2025 Wk12 read-only test): RB/WR lists football-credible (McCaffrey/Gibbs/Brown; JSN/London/Pickens up top, no backups over starters). Engine works end-to-end on real data. NOT YET WRITTEN to edge_scores — read-only test only.
 
-**Phase 4 status**: fully written (4.1-4.6). Steps 4.1-4.5 tested and verified
-by hand against synthetic data. 4.6 is written and logically sound but
-untestable until Phase 3.6 (backfill of 2025 season player stats) is done —
-that backfill, plus fixing whatever field-name mismatches it reveals in
-compute_edge_scores.py, is the next work session.
+**### PARKED NOTES (address later, not blockers)** - QB volume artifact: Brissett/Flacco projected above Mahomes/Allen in Wk12 test — high-attempt garbage-time games; v1 QB model is volume-weighted, expect regression calibration to temper. Not wrong, just uncalibrated. - team_id drift: [players.team](http://players.team)_id = current (2026) team; historical joins keyed on it pull wrong 2025 player-games (Flacco showed as CIN in a CLE game). rush_share unaffected (reads DEF row, not player join) but ANY future historical-stat join on current team_id is a landmine. Need per-game team resolution for historical work. - DST review (own task): (1) fumble_recovery_tds currently EXCLUDED in dst_[features.py](http://features.py) docstring to avoid double-count, but Cursor's 544-row analysis suggests this UNDER-counts real def TDs (def_tds correlates 1:1 with def_interceptions, zero counterexamples; fumble-return TDs score 0 in 15/18 cases). Proposed: add fumble_recovery_tds when fumble_recovery_own==0 that game. (2) Blocked kicks derivable via opponent-join but rare (5.7%, ~3pts) — lean skip+document for v1. Neither applied. Resolve against formula doc.For later: resume bullet synthesis
 
 
 
-## For later: resume bullet synthesis
+**### NEXT STEP** Write offense Edge scores to edge_scores (compute_and_write_edge_scores, real Wk12 or current-week data), confirm rows land, THEN dedicated DST review.
+
+
 
 When ready to draft resume bullets, paste the relevant phase(s) above back into a
 
