@@ -1,7 +1,9 @@
 """Backfill 2025 player_game_stats from nflverse weekly stats.
 
-WRITES TO THE DATABASE. Idempotent: skips any (player_id, game_id) pair
-that already exists in player_game_stats.
+WRITES TO THE DATABASE. Idempotent: for any (player_id, game_id) pair that
+already exists in player_game_stats, the stats JSONB is left untouched --
+only the top-level team_id/opponent_team_id columns are (re-)set via an
+UPDATE, resolved the same way as for new inserts.
 
 Two separate paths, matching how nflverse itself splits the data:
 
@@ -215,7 +217,7 @@ def _build_skill_rows(
     team_by_abbr: dict[str, str],
     game_by_team_week: dict[tuple[str, str], str],
     existing_keys: set[tuple[str, str]],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     players = _fetch_all_players(client)
     skill_players = [p for p in players if p.get("position") in SKILL_POSITIONS]
 
@@ -256,9 +258,11 @@ def _build_skill_rows(
     print(f"{len(reg)} REG-season rows for skill positions {sorted(SKILL_POSITIONS)}.")
 
     to_insert: list[dict[str, Any]] = []
+    to_update: list[dict[str, Any]] = []
     stats_keys: set[str] = set()
     unmapped_gsis = 0
     unmapped_team = 0
+    unmapped_opponent_team = 0
     no_game_found = 0
     skipped_existing = 0
     zero_stat_weeks: set[tuple[str, int]] = set()  # (team_abbr, week) with no matched player
@@ -277,6 +281,11 @@ def _build_skill_rows(
             unmapped_team += 1
             continue
 
+        opponent_abbr = _normalize_nflverse_abbreviation(row_dict.get("opponent_team"))
+        opponent_team_id = team_by_abbr.get(opponent_abbr)
+        if opponent_team_id is None:
+            unmapped_opponent_team += 1
+
         week_str = str(int(row_dict["week"]))
         game_id = game_by_team_week.get((team_id, week_str))
         if game_id is None:
@@ -287,12 +296,24 @@ def _build_skill_rows(
         key = (player["player_id"], game_id)
         if key in existing_keys:
             skipped_existing += 1
+            to_update.append({
+                "player_id": player["player_id"],
+                "game_id": game_id,
+                "team_id": team_id,
+                "opponent_team_id": opponent_team_id,
+            })
             continue
 
         stats = _row_to_json_safe(pd.Series(row_dict), SKILL_METADATA_COLUMNS)
         stats_keys.update(stats.keys())
 
-        to_insert.append({"player_id": player["player_id"], "game_id": game_id, "stats": stats})
+        to_insert.append({
+            "player_id": player["player_id"],
+            "game_id": game_id,
+            "team_id": team_id,
+            "opponent_team_id": opponent_team_id,
+            "stats": stats,
+        })
         existing_keys.add(key)
 
     summary = {
@@ -300,13 +321,14 @@ def _build_skill_rows(
         "to_insert": len(to_insert),
         "unmapped_gsis": unmapped_gsis,
         "unmapped_team": unmapped_team,
+        "unmapped_opponent_team": unmapped_opponent_team,
         "no_game_found": no_game_found,
         "skipped_existing": skipped_existing,
         "distinct_players_covered": len({r["player_id"] for r in to_insert}),
         "stats_keys": sorted(stats_keys),
         "zero_game_matches": sorted(zero_stat_weeks),
     }
-    return to_insert, summary
+    return to_insert, to_update, summary
 
 
 def _build_def_rows(
@@ -314,7 +336,7 @@ def _build_def_rows(
     team_by_abbr: dict[str, str],
     game_by_team_week: dict[tuple[str, str], str],
     existing_keys: set[tuple[str, str]],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     result = (
         client.table("players")
         .select("player_id, full_name, team_id")
@@ -334,8 +356,10 @@ def _build_def_rows(
     print(f"{len(reg)} REG-season team-week rows.")
 
     to_insert: list[dict[str, Any]] = []
+    to_update: list[dict[str, Any]] = []
     stats_keys: set[str] = set()
     unmapped_team = 0
+    unmapped_opponent_team = 0
     no_def_player = 0
     no_game_found = 0
     skipped_existing = 0
@@ -354,6 +378,11 @@ def _build_def_rows(
             no_def_player += 1
             continue
 
+        opponent_abbr = _normalize_nflverse_abbreviation(row_dict.get("opponent_team"))
+        opponent_team_id = team_by_abbr.get(opponent_abbr)
+        if opponent_team_id is None:
+            unmapped_opponent_team += 1
+
         week_str = str(int(row_dict["week"]))
         game_id = game_by_team_week.get((team_id, week_str))
         if game_id is None:
@@ -364,20 +393,31 @@ def _build_def_rows(
         key = (def_player["player_id"], game_id)
         if key in existing_keys:
             skipped_existing += 1
+            to_update.append({
+                "player_id": def_player["player_id"],
+                "game_id": game_id,
+                "team_id": team_id,
+                "opponent_team_id": opponent_team_id,
+            })
             continue
 
         stats = _row_to_json_safe(pd.Series(row_dict), TEAM_METADATA_COLUMNS)
         stats_keys.update(stats.keys())
 
-        to_insert.append(
-            {"player_id": def_player["player_id"], "game_id": game_id, "stats": stats}
-        )
+        to_insert.append({
+            "player_id": def_player["player_id"],
+            "game_id": game_id,
+            "team_id": team_id,
+            "opponent_team_id": opponent_team_id,
+            "stats": stats,
+        })
         existing_keys.add(key)
 
     summary = {
         "reg_rows_seen": len(reg),
         "to_insert": len(to_insert),
         "unmapped_team": unmapped_team,
+        "unmapped_opponent_team": unmapped_opponent_team,
         "no_def_player": no_def_player,
         "no_game_found": no_game_found,
         "skipped_existing": skipped_existing,
@@ -385,7 +425,7 @@ def _build_def_rows(
         "stats_keys": sorted(stats_keys),
         "zero_game_matches": sorted(zero_stat_weeks),
     }
-    return to_insert, summary
+    return to_insert, to_update, summary
 
 
 def backfill_player_game_stats() -> None:
@@ -410,7 +450,7 @@ def backfill_player_game_stats() -> None:
     )
 
     print("\n--- SKILL PLAYERS (QB/RB/WR/TE/K) ---")
-    skill_rows, skill_summary = _build_skill_rows(
+    skill_rows, skill_updates, skill_summary = _build_skill_rows(
         client, team_by_abbr, game_by_team_week, existing_keys
     )
     skill_inserted = 0
@@ -419,13 +459,25 @@ def backfill_player_game_stats() -> None:
         skill_inserted += len(result.data or [])
 
     print("\n--- TEAM DEFENSE (DEF) ---")
-    def_rows, def_summary = _build_def_rows(
+    def_rows, def_updates, def_summary = _build_def_rows(
         client, team_by_abbr, game_by_team_week, existing_keys
     )
     def_inserted = 0
     for chunk in _chunks(def_rows):
         result = client.table("player_game_stats").insert(chunk).execute()
         def_inserted += len(result.data or [])
+
+    print("\n--- BACKFILLING team_id/opponent_team_id ON EXISTING ROWS ---")
+    all_updates = skill_updates + def_updates
+    rows_updated = 0
+    for i, update in enumerate(all_updates, start=1):
+        client.table("player_game_stats").update({
+            "team_id": update["team_id"],
+            "opponent_team_id": update["opponent_team_id"],
+        }).eq("player_id", update["player_id"]).eq("game_id", update["game_id"]).execute()
+        rows_updated += 1
+        if i % BATCH_SIZE == 0 or i == len(all_updates):
+            print(f"  ...{i}/{len(all_updates)} existing rows updated")
 
     print("\n=== CRITICAL OUTPUT: distinct JSONB keys actually written ===")
     print(f"SKILL ({len(skill_summary['stats_keys'])} keys):")
@@ -457,6 +509,17 @@ def backfill_player_game_stats() -> None:
     print(f"  Distinct teams covered:             {def_summary['distinct_teams_covered']}")
     if def_summary["zero_game_matches"]:
         print(f"  Team/weeks with no matching game:   {def_summary['zero_game_matches']}")
+
+    print("\nTEAM_ID / OPPONENT_TEAM_ID BACKFILL:")
+    print(f"  Existing rows updated:                       {rows_updated}")
+    print(
+        f"  Unmapped opponent_team abbr (SKILL, team_id still set): "
+        f"{skill_summary['unmapped_opponent_team']}"
+    )
+    print(
+        f"  Unmapped opponent_team abbr (DEF, team_id still set):   "
+        f"{def_summary['unmapped_opponent_team']}"
+    )
 
     all_covered_game_ids = {r["game_id"] for r in skill_rows} | {r["game_id"] for r in def_rows}
     for pair in existing_keys:
