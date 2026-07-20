@@ -76,6 +76,8 @@ def _fetch_existing_players(client) -> dict[str, dict[str, Any]]:
 def _should_include(player: dict[str, Any]) -> bool:
     if player.get("position") not in ALLOWED_POSITIONS:
         return False
+    if player.get("position") == "DEF":
+        return True
     if player.get("status") in SKIP_STATUSES:
         return False
     if not player.get("full_name"):
@@ -90,6 +92,19 @@ def _map_player(
     player: dict[str, Any],
     team_by_abbr: dict[str, str],
 ) -> dict[str, Any]:
+    if player.get("position") == "DEF":
+        team_abbr = sleeper_id.upper()
+        team_id = team_by_abbr.get(team_abbr)
+        return {
+            "full_name": f"{team_abbr} DEF",
+            "team_id": team_id,
+            "position": "DEF",
+            "status": player.get("status") or "Active",
+            "depth_chart_rank": None,
+            "external_ids": {"sleeper_id": sleeper_id},
+            "sport": "nfl",
+        }
+
     team_abbr = player.get("team")
     team_id = team_by_abbr.get(team_abbr) if team_abbr else None
 
