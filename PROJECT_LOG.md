@@ -234,13 +234,91 @@ conventions and will need verification/adjustment against whatever schema
 the real backfilled data actually uses.
 - **## Phase 4.6 — scoring engine key reconciliation (offense COMPLETE, DST pending review)** - Reconciled compute_edge_[scores.py](http://scores.py) placeholder keys → real nflverse keys. Straight renames (pass_attempts→attempts, rush_yards→rushing_yards, etc.), derived adot (receiving_air_yards/targets) and rush_share (player carries ÷ team carries off the team's DEF-row box score), replaced hardcoded team-volume baselines with real EWMA'd values via same DEF-row trick. - VERIFIED: DEF-row carry total = sum of nflverse player carries (5/5 team-weeks at source). rush_share denominator is sound. - OFFENSE RANKINGS PLAUSIBLE (2025 Wk12 read-only test): RB/WR lists football-credible (McCaffrey/Gibbs/Brown; JSN/London/Pickens up top, no backups over starters). Engine works end-to-end on real data. NOT YET WRITTEN to edge_scores — read-only test only.
 
-**### PARKED NOTES (address later, not blockers)** - QB volume artifact: Brissett/Flacco projected above Mahomes/Allen in Wk12 test — high-attempt garbage-time games; v1 QB model is volume-weighted, expect regression calibration to temper. Not wrong, just uncalibrated. - team_id drift: [players.team](http://players.team)_id = current (2026) team; historical joins keyed on it pull wrong 2025 player-games (Flacco showed as CIN in a CLE game). rush_share unaffected (reads DEF row, not player join) but ANY future historical-stat join on current team_id is a landmine. Need per-game team resolution for historical work. - DST review (own task): (1) fumble_recovery_tds currently EXCLUDED in dst_[features.py](http://features.py) docstring to avoid double-count, but Cursor's 544-row analysis suggests this UNDER-counts real def TDs (def_tds correlates 1:1 with def_interceptions, zero counterexamples; fumble-return TDs score 0 in 15/18 cases). Proposed: add fumble_recovery_tds when fumble_recovery_own==0 that game. (2) Blocked kicks derivable via opponent-join but rare (5.7%, ~3pts) — lean skip+document for v1. Neither applied. Resolve against formula doc.For later: resume bullet synthesis
+**## Phase 4.7 — edge_scores write path proven (plumbing test COMPLETE)**
 
+**Goal (deliberately narrow): confirm the edge_scores WRITE PATH works — upsert**
 
+**lands, dedup holds, factor_breakdown populates. NOT a model-validation step; NOT a**
 
-**### NEXT STEP** Write offense Edge scores to edge_scores (compute_and_write_edge_scores, real Wk12 or current-week data), confirm rows land, THEN dedicated DST review.
+**backtest. Numbers intentionally throwaway.**
 
+**What was done:**
 
+**- Added** `UNIQUE (player_id, score_type, period)` **constraint to edge_scores**
+
+  ****`edge_scores_player_score_period_uniq`**) — required by the existing upsert's**
+
+  ****`on_conflict` **clause, and correct long-term design for every real write. This is**
+
+  **now permanent (kept, not rolled back).**
+
+**- Ran a throwaway script** `_tmp_plumbing_test_wk12.py`**, since deleted) that reused**
+
+  **the real feature builders / points calculators but selected 2025 Wk12 games and**
+
+  **wrote under** `period='2025-WK12-TEST'`**.**
+
+**- Result: 813 offense rows (QB 113 / RB 173 / WR 342 / TE 185). total_rows ==**
+
+  **distinct_keys == 813 (upsert dedup verified, not incidental). factor_breakdown**
+
+  **confirmed as real populated JSONB on every row. Position routing/join clean**
+
+  **(no position bleed). Rows eyeballed, then DELETED — edge_scores back to 0 rows**
+
+  **for that period. Throwaway script deleted.**
+
+****CONCLUSION: the edge_scores write path (upsert + factor_breakdown + percentile**
+
+**rank + positional_rank) works end-to-end on real data.** This had NEVER been**
+
+**exercised before — prior Phase 4.6 "offense complete" was a READ-ONLY test.**
+
+**### PARKED NOTES (new, from this session — both gate the real backtest, neither is a blocker now)**
+
+**1. 2025 season has stats but ZERO odds. All 2025 games have null**
+
+   **implied_home_score / implied_away_score / game_total (0 of ~272). Consequence:**
+
+   **every game-script-dependent feature is uncomputable for 2025 —** `team_spread`
+
+   **returns None and projections die at the spread gate. The plumbing test only**
+
+   **produced rows by injecting a neutral** `spread=0.0` **fallback (hence** `game_script:0`
+
+   **on every row — a known artifact, not a bug). **This is the gating decision for**
+
+   **the real backtest (Option A):** either (a) backfill 2025 historical odds, (b)**
+
+   **run the backtest on odds-independent features only and document game-script as**
+
+   **excluded, or (c) skip 2025 backtesting and validate live once 2026 provides real**
+
+   **odds. DECISION OWED before any backtest — do not default it.**
+
+**2. Neutral-spread QB volume artifact reconfirmed. With game_script zeroed,**
+
+   **top QBs were Stafford/Lawrence/Goff (high-volume passers), no Mahomes/Allen —**
+
+   **same volume-weighting pattern already parked in Phase 4.6 (Brissett/Flacco),**
+
+   **now compounded by zeroed game-script. Expected behavior of an uncalibrated,**
+
+   **odds-less, leakage-present run. Not a new issue; folded into the existing**
+
+   **calibration expectation.**
+
+**### STILL AHEAD (unchanged order, all deferred on purpose)**
+
+**1. team_id historical-join bug (Flacco-as-CIN landmine) — own step.**
+
+**2. Real leakage-safe backtest (Option A) — needs as-of time boundary built AND the**
+
+   **2025-odds decision above resolved.**
+
+**3. DST review (fumble_recovery_tds undercount + blocked-kicks skip).**
+
+**4. THEN Phase 4 genuinely done → Lovable frontend.**
 
 When ready to draft resume bullets, paste the relevant phase(s) above back into a
 
