@@ -59,6 +59,22 @@ def _get_upcoming_game(client, team_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def _get_game_for_period(client, team_id: str, season: int, week: int) -> dict | None:
+    """Specific game for a team in a given season/week — used for historical/backtest scoring."""
+    result = (
+        client.table("games")
+        .select("*")
+        .eq("sport", "nfl")
+        .eq("season", season)
+        .eq("week_or_date", str(week))
+        .or_(f"home_team_id.eq.{team_id},away_team_id.eq.{team_id}")
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
 def _get_stat_history(
     client, player_id: str, keys: list[str], n: int = NUM_HISTORY_GAMES
 ) -> tuple[dict, list[str]]:
@@ -139,18 +155,33 @@ def _get_team_offense_baseline(
     return {"carries": carries, "attempts": attempts}
 
 
-def compute_player_projection(client, player: dict, def_player_by_team: dict[str, str]) -> dict | None:
+def compute_player_projection(
+    client,
+    player: dict,
+    def_player_by_team: dict[str, str],
+    season: int | None = None,
+    week: int | None = None,
+) -> dict | None:
     """
     Routes a player to the correct feature builder + points calculator based
     on position. Returns {"points": float, "features": dict} or None if the
-    player has no upcoming game or insufficient data.
+    player has no target game or insufficient data.
+
+    By default (season and week both None) this projects the player's next
+    real upcoming game (live use). Pass both season and week to instead
+    target a specific historical game (backtest/historical use) — the
+    `period` string elsewhere is a display label only and never controls
+    which game gets selected.
     """
     position = player["position"]
     team_id = player["team_id"]
     if not team_id:
         return None
 
-    game = _get_upcoming_game(client, team_id)
+    if season is not None and week is not None:
+        game = _get_game_for_period(client, team_id, season, week)
+    else:
+        game = _get_upcoming_game(client, team_id)
     if not game:
         return None
 
@@ -270,7 +301,17 @@ def compute_player_projection(client, player: dict, def_player_by_team: dict[str
     return {"points": points, "features": features, "game_id": game["game_id"]}
 
 
-def compute_and_write_edge_scores(period: str = "week1") -> None:
+def compute_and_write_edge_scores(
+    period: str = "week1",
+    season: int | None = None,
+    week: int | None = None,
+) -> None:
+    """
+    `period` is a display label only (written to edge_scores.period) — it does
+    NOT control which games get selected. Pass `season`/`week` together to
+    target a specific historical week (backtest/historical use); leave both
+    None to project each player's next real upcoming game (live use, default).
+    """
     client = get_supabase_client()
 
     players_result = client.table("players").select("*").eq("sport", "nfl").execute()
@@ -281,7 +322,7 @@ def compute_and_write_edge_scores(period: str = "week1") -> None:
     # Compute raw points for every player first (needed for percentile ranking)
     projections = {}  # player_id -> {points, features, game_id, position}
     for player in players:
-        proj = compute_player_projection(client, player, def_player_by_team)
+        proj = compute_player_projection(client, player, def_player_by_team, season=season, week=week)
         if proj:
             proj["position"] = player["position"]
             projections[player["player_id"]] = proj
