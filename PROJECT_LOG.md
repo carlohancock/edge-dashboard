@@ -304,13 +304,70 @@ the real backfilled data actually uses.
 
 ---
 
+## Phase 5 — Draft Edge (season-long positional rankings for 2026 draft)
+
+**Framing:** July 2026, zero 2026 games played. Draft Edge is NOT a trailing-EWMA computation like weekly Edge — it projects each player's 2026 role from their 2025 full-season performance as the base, adjusted by their *current* (2026) team/depth-chart context from the `players` table. Scarcity and ADP value gap replace the per-week matchup factor. No market-blend features (no 2026 odds data this far before the season — expected, not a gap).
+
+**New files:**
+- `scoring/season_stats.py` — season-level aggregation path (Task 1). Sums a player's full 2025 `player_game_stats` into season totals/rates (attempts, targets, carries, yards, TDs, etc.), plus season-long rate stats. Uses per-game `team_id` from Phase 4.8 backfill (not `players.team_id`) to resolve which team a player was on in 2025. Deliberately does NOT reuse `compute_edge_scores.py`'s `_get_upcoming_game` / `_get_game_for_period` machinery.
+- `scoring/draft_edge_features.py` — position-specific 2026 role projection from 2025 season totals + current depth chart (Task 2). Reuses the same projected-stat key names as weekly feature builders so `points_calculator.py` works unmodified.
+- `pipeline/seed_adp.py` — ADP ingestion (Task 3).
+- `scoring/compute_draft_edge.py` — orchestration: scarcity, ADP value gap, write to `edge_scores` (Tasks 4–5).
+
+**Task 1 — Season-level aggregation + shrinkage k reconsidered:** TD-rate shrinkage constants were NOT blindly reused from weekly Edge — weekly k's (QB 150, RB rush 100/rec 60, WR/TE rec 60) were tuned for ~5-game EWMA windows (within-season noise smoothing). Season-level Draft Edge uses ONE full 2025 season to forecast a different 2026 season — structurally a year-over-year forecasting problem where TD rate is especially noisy. v1 choice: roughly double each weekly k (QB pass TD/INT 300, RB rush 200/rec 120, WR/TE rec 120) as an explicit forecasting-uncertainty premium. Documented in `season_stats.py`; revisit once 2025→2026 outcome pairs exist for empirical fit.
+
+**Task 2 — Role/context changes:**
+- **Unchanged role:** 2025 season rates blended against a depth-chart-implied prior share (hand-set v1 priors by `depth_chart_rank` — e.g. RB rank-1 rush_share ~58%, WR rank-1 target_share ~22%). Blend weight scales with 2025 games played; captures promoted backups and demoted starters.
+- **Team changed (`context_changed: true`):** 2025 team-context stats (target share, rush share) may not transfer — flagged explicitly rather than projected blindly. Still produces a best-effort projection (observed rate blended toward current-team depth-chart prior, with confidence in the 2025 rate halved), but `context_changed` is visible in `factor_breakdown`.
+- **No 2025 NFL stats (`no_historical_data: true`):** rookies and anyone with zero 2025 game rows — no fabricated projection from nothing. Falls back to ADP-anchored placeholder (linear interpolation of projected points by ADP among real projections at the position; floor below worst real projection if no ADP). Also flags `low_sample: true`.
+
+**Task 3 — ADP data source:** Fantasy Football Calculator's free public REST API (`https://fantasyfootballcalculator.com/api/v1/adp/ppr?teams=12&year=2026`). Picked over Sleeper — Sleeper has no aggregated ADP endpoint; reconstructing from raw draft picks would require a heavy multi-endpoint crawl for the same end result FFC publishes directly. PPR format matches this league's full-PPR scoring. 12-team default (league size not tracked yet — flagged for revisit). Ran successfully: 217/217 FFC rows matched to `players` (skill positions by normalized name+team; DEF by team abbreviation; unicode normalization fixed the one accented-name miss). Populates `adp` table idempotently (insert new / update existing by source).
+
+**Tasks 4–5 — Scarcity, ADP value gap, output:**
+- **Scarcity:** within each position, point gap to the next-ranked player (`scarcity_gap_to_next_rank` in `factor_breakdown`). v1 simple version per formula doc.
+- **ADP value gap:** `your_projected_positional_rank − adp_positional_rank`, surfaced as its own distinct field (`adp_value_gap`) — not folded into a composite score. Positive = market ranks player better than model (potential fade); negative = model likes player more than market (potential value).
+- **Output:** writes to `edge_scores` with `score_type='draft_edge'`, `period='2026-draftedge'`, `positional_rank` populated, `score_value` null (rank-based, not /100). `factor_breakdown` includes season-level opportunity/efficiency components, scarcity, ADP value gap, and all flags.
+
+**Run results:** 991 players scored end-to-end (QB 129 / RB 204 / WR 399 / TE 216 / K 43). 544 real 2025-history-based projections; 447 ADP-anchored placeholders (no 2025 stats — mostly depth/bench players and rookies).
+
+**Spot-check (top 15 per position, football-plausibility read — same spirit as Phase 4.6 Wk12 test):**
+- **RB:** McCaffrey #1, Bijan #2, Gibbs #3, Jonathan Taylor #4, Achane #5 — credible elite tier. McCaffrey scarcity gap 31.5 pts to Bijan (steep drop-off flagged correctly).
+- **WR:** Puka #1, JSN #2, Chase #3, ARSB #4 — credible. Justin Jefferson #12 with `adp_value_gap=+7` (model much lower than market ADP rank 5) — plausible given projection methodology; worth monitoring.
+- **TE:** McBride #1 with 96.7 pt scarcity gap to #2 — correctly signals TE1 urgency.
+- **QB:** Stafford #1 / Drake Maye #2 reflects 2025 full-season volume weighting without game-script adjustment (same class of uncalibrated volume artifact parked since Phase 4.7, now at season grain). Allen/Mahomes in top 5 — directionally sane.
+- **K:** Fairbairn #1, Myers #2 — plausible; several kickers flagged `no_historical_data` where 2025 crosswalk missed them (see revisit below).
+
+**Team-change verification (`context_changed` flag):** checked against per-game `team_id` from Phase 4.8 backfill vs current `players.team_id`:
+| Player | 2025 primary team | 2026 current team | Flagged? |
+|---|---|---|---|
+| Kyler Murray | ARI | MIN | ✅ `context_changed` (+ `low_sample`, 5 GP) |
+| Travis Etienne | JAX | NO | ✅ `context_changed` |
+| Kenneth Walker | SEA | KC | ✅ `context_changed` |
+| David Montgomery | DET | HOU | ✅ `context_changed` |
+| Jaylen Waddle | MIA | DEN | ✅ `context_changed` |
+
+All five correctly flagged — not silently mis-projected as if still on their 2025 team.
+
+**Not touched (per scope):** `vegas_features.py`, weekly Edge/Wire Edge logic, DST scoring, frontend.
+
+**Flagged for revisit:**
+1. **Depth-chart priors** — hand-set v1 tables in `draft_edge_features.py`; replace with empirical depth-rank→share regression once outcome data exists.
+2. **Season-level shrinkage k** — doubled weekly k's as a reasoned starting point; fit empirically against 2025→2026 outcomes in the regression calibration phase.
+3. **12-team ADP assumption** — FFC ADP scoped to 12 teams; update `ADP_TEAMS` in `seed_adp.py` once real league size is known.
+4. **Crosswalk gaps → false `no_historical_data`** — e.g. Tyler Bass (established kicker, zero 2025 rows because his sleeper_id didn't crosswalk to nflverse — same Phase 3.6 residual class, not a Draft Edge bug). Handled safely by ADP placeholder but worth monitoring on re-seed.
+5. **QB volume artifact at season grain** — full-season pass volume dominates top-QB ranking without game-script or market blend; same family of issue parked since Phase 4.7, now visible in Draft Edge too. Resolution waits on Phase 5 regression calibration + 2026 live odds.
+6. **PostgREST 1000-row pagination** — hardened in `compute_draft_edge.py` (draft pool currently 991, just under the silent-truncation cap). Monitor as player pool grows.
+
+---
+
 ## STILL AHEAD (Phase 4 remaining, then onward — order matters)
 
 1. **Wire scoring engine to per-game team columns.** Switch `compute_edge_scores.py` (rush_share resolution + any team-relative lookup, AND the season/week backtest path added in 4.9) to read `player_game_stats.team_id` / `opponent_team_id` instead of `players.team_id`. Needed for a fully correct backtest — otherwise compute-time team resolution re-introduces the bug the 4.8 data fix removed, for any traded player.
 2. **2025-odds decision remainder.** Option (b) (odds-free backtest) is now executed for QB/RB/WR/TE/K — see 4.9 results above. Still open: whether to (a) backfill 2025 historical odds to also validate game-script/market-blend/kicker-implied-total against real 2025 data, or (c) defer that validation to live 2026 odds. No code until decided.
 3. **Full leakage-safe backtest, vegas included.** Requires (1) done and (2) resolved. 4.9's non-vegas backtest is a real but partial leakage-safe backtest (proves the harness + opportunity/efficiency math); the game-script/market-blend half is still unvalidated.
 4. ~~**DST review**~~ — RESOLVED, see Phase 4.10 above.
-5. **THEN Phase 4 is genuinely done → Lovable frontend**, then EdgeGM, automation, deploy.
+5. ~~**Draft Edge**~~ — RESOLVED, see Phase 5 above.
+6. **THEN Phase 4 is genuinely done → Lovable frontend**, then EdgeGM, automation, deploy.
 
 ---
 
