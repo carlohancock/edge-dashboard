@@ -292,12 +292,24 @@ the real backfilled data actually uses.
 
 ---
 
+## Phase 4.10 — DST review (fumble_recovery_tds undercount + blocked-kicks decision, both RESOLVED)
+
+**Scope:** resolves the "DST review" item parked in the STILL AHEAD list since Phase 4.6/4.7 (`dst_features.py`/`points_calculator.py`'s DST logic was written ahead-of-plan in 4.6 and quarantined pending this review). Two issues, both investigated against the real 544-row 2025 DEF backfill before touching any code — no changes made on assumption alone.
+
+**Issue 1 — fumble_recovery_tds, previously excluded, now scored.** The original v1 exclusion reasoning ("ambiguous overlap risk with def_tds") was checked against nflverse's actual stat-aggregation source (nflfastR's `calculate_stats.R`) and REFUTED: `def_tds`/`special_teams_tds` are both built from a `td_ids()` list that explicitly excludes stat_ids 56/58/60/62 (fumble-recovery TDs), which are "separately counted in fumble_recovery_tds" per a source comment — zero overlap by definition. Separately, the practical undercount was confirmed directly against real data: of 18 team-weeks with `fumble_recovery_tds > 0`, 14 (78%) had `def_tds == 0` that same week. The originally-proposed fix (gate the credit on `fumble_recovery_own == 0`) was tested against the data and found to be the WRONG fix — `fumble_recovery_own` is a weekly aggregate dominated by ordinary non-scoring recoveries (season sum 246 vs. only 19 total `fumble_recovery_tds`), so that gate would incorrectly zero out real defensive TD credit any week a team also recovered an unrelated fumble of its own. Implemented instead: `fumble_recovery_tds` is now an explicit input to `build_dst_features` (`own_fumble_recovery_td_history`), folded unconditionally into `proj_def_st_tds` and also reported separately as `proj_fumble_recovery_tds` for factor_breakdown auditability. `points_calculator.py` needed no logic change (same flat `touchdown` rate already applied) — updated its comment only. This intentionally mirrors how INT-return pick-sixes already double-credit (2 pts takeaway + 6 pts TD = 8) — not a new inconsistency. VERIFIED: synthetic test + a real 2025 game (BAL DEF, `fumble_recovery_tds=1`, `def_tds=0`) both confirm the fix adds points where the pre-4.10 code would have missed them (real-game case: +6.0 pts, exactly the `touchdown` rule value).
+
+**Issue 2 — blocked kicks, confirmed skip-for-v1 (deliberate, documented, not an oversight).** Verified the previously-cited "~5.7% of games" estimate against real data: `fg_blocked + pt_blocked` team-weeks = 31/544 = 5.7% (near-exact match). Including `pat_blocked` + `gwfg_blocked` (the latter a tagged subset of `fg_blocked`, not a separate event) = 43/544 = 7.9%. Either way, low-frequency and low point value (+3) relative to the opponent-row join required to attribute it correctly (a block shows up on the opposing team's own box score, not this team's) — expected value is only ~0.15–0.25 pts/week league-wide. Decision: skip for v1, confirmed rather than assumed. Documented permanently in `dst_features.py`'s module docstring so this reads as a deliberate choice on re-read, not a gap.
+
+**Not touched this session (per scope):** Draft Edge, frontend, `vegas_features.py`.
+
+---
+
 ## STILL AHEAD (Phase 4 remaining, then onward — order matters)
 
 1. **Wire scoring engine to per-game team columns.** Switch `compute_edge_scores.py` (rush_share resolution + any team-relative lookup, AND the season/week backtest path added in 4.9) to read `player_game_stats.team_id` / `opponent_team_id` instead of `players.team_id`. Needed for a fully correct backtest — otherwise compute-time team resolution re-introduces the bug the 4.8 data fix removed, for any traded player.
 2. **2025-odds decision remainder.** Option (b) (odds-free backtest) is now executed for QB/RB/WR/TE/K — see 4.9 results above. Still open: whether to (a) backfill 2025 historical odds to also validate game-script/market-blend/kicker-implied-total against real 2025 data, or (c) defer that validation to live 2026 odds. No code until decided.
 3. **Full leakage-safe backtest, vegas included.** Requires (1) done and (2) resolved. 4.9's non-vegas backtest is a real but partial leakage-safe backtest (proves the harness + opportunity/efficiency math); the game-script/market-blend half is still unvalidated.
-4. **DST review** (independent of the above): fumble_recovery_tds undercount question + blocked-kicks skip decision — resolve against league_scoring_rules.md.
+4. ~~**DST review**~~ — RESOLVED, see Phase 4.10 above.
 5. **THEN Phase 4 is genuinely done → Lovable frontend**, then EdgeGM, automation, deploy.
 
 ---

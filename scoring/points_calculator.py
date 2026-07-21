@@ -104,6 +104,11 @@ def calculate_dst_points(dst_features: dict) -> float:
     # approximation.
     points += dst_features["proj_takeaways"] * r["interception"]
     points += dst_features["proj_forced_fumbles"] * r["forced_fumble"]
+    # proj_def_st_tds (Phase 4.10) now includes fumble-return TDs alongside
+    # def_tds/special_teams_tds -- all score at the same flat "touchdown"
+    # rate per league_scoring_rules.py, so no separate rule/key is needed
+    # here even though fumble-return TDs are a distinct feature upstream
+    # (see dst_features.py's module docstring for the full review).
     points += dst_features["proj_def_st_tds"] * r["touchdown"]
     points += dst_features["proj_safeties"] * r["safety"]
 

@@ -259,6 +259,7 @@ def compute_player_projection(
         own_hist, _ = _get_stat_history(client, player["player_id"], [
             "def_sacks", "def_interceptions", "fumble_recovery_opp",
             "def_fumbles_forced", "def_tds", "special_teams_tds", "def_safeties",
+            "fumble_recovery_tds",
         ])
         own_takeaways_history = [
             own_hist["def_interceptions"][i] + own_hist["fumble_recovery_opp"][i]
@@ -290,7 +291,7 @@ def compute_player_projection(
         features = build_dst_features(
             opp_implied,
             own_hist["def_sacks"], own_takeaways_history, own_hist["def_fumbles_forced"],
-            own_def_st_tds_history, own_hist["def_safeties"],
+            own_def_st_tds_history, own_hist["fumble_recovery_tds"], own_hist["def_safeties"],
             opp_sacks_suffered_history, opp_giveaways_history, opp_yards_history,
         )
         points = calculate_dst_points(features)
