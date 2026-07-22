@@ -358,6 +358,40 @@ All five correctly flagged — not silently mis-projected as if still on their 2
 5. **QB volume artifact at season grain** — full-season pass volume dominates top-QB ranking without game-script or market blend; same family of issue parked since Phase 4.7, now visible in Draft Edge too. Resolution waits on Phase 5 regression calibration + 2026 live odds.
 6. **PostgREST 1000-row pagination** — hardened in `compute_draft_edge.py` (draft pool currently 991, just under the silent-truncation cap). Monitor as player pool grows.
 
+### Phase 5 calibration — unified volume/efficiency shrinkage (COMPLETE)
+
+**Three bugs, one root cause:** v1 Draft Edge only shrinkage-regressed TD rate. Volume, efficiency, and per-game rates were replayed at face value — so (1) McCaffrey's outlier 2025 workload inflated 2026 projection, (2) Kyler Murray's 5-GP sample extrapolated to a full season with `low_sample` label-only (no magnitude discount), (3) ADP-interpolation placeholders injected artificial near-zero scarcity gaps in the mid-tier RB chain.
+
+**Fix — generalized empirical-Bayes shrinkage (`season_regressed_stat` in `season_stats.py`, wired through `draft_edge_features.py`):**
+- Regresses projected volume, efficiency, and per-game rates toward position-role baselines, not just TD rate.
+- Shrinkage weight scales with 2025 games played (thin samples pull hard toward baseline).
+- Distance-from-baseline term: outlier seasons regress more than median-starter seasons.
+- Baselines conditioned on `depth_chart_rank` where sample exists, with position-wide trimmed-mean fallback.
+
+**Baseline-contamination guard (Task 2):** baselines built from trimmed means (10% each tail) of **raw 2025 observed counting/rate stats** among players with `games_played >= MIN_SEASON_GAMES` — never from projected fantasy points or unregressed Draft Edge outputs, so outliers being corrected cannot pull their own regression target upward.
+
+**Scarcity-placeholder exclusion (Task 4):** players with `no_historical_data: true` excluded from `scarcity_gap_to_next_rank` computation; real players scored against real neighbors only; placeholders get `null` scarcity.
+
+**Tunable constant:** single `SHRINKAGE_STRENGTH` in `season_stats.py` (TD rate keeps separate `SEASON_TD_RATE_K` table).
+
+**Strength selection — NOT the 380–400 McCaffrey heuristic:** that band came from the original calibration prompt as an aspirational full-PPR ceiling, not from repo data. McCaffrey's actual 2025 league-rule fantasy total is **420.6 pts** — the heuristic undershot reality and was discarded as a selection criterion. Instead, tested strengths {3.0, 5.0, 6.0, 8.0, 18.0} for **Spearman rank-order agreement** between 2026 projections and actual 2025 season-end fantasy finish among the top-30 RBs (full-PPR, `points_calculator.py` on raw 2025 totals):
+
+| Strength | Spearman ρ | Mean \|Δrank\| |
+|---|---|---|
+| 3.0 | 0.880 | 2.40 |
+| 5.0 | 0.883 | 2.27 |
+| **6.0** | **0.886** | **2.20** |
+| 8.0 | 0.885 | 2.27 |
+| 18.0 | 0.867 | 2.53 |
+
+**Chosen: `SHRINKAGE_STRENGTH = 6.0`** — best top-30 RB rank correlation (margins vs 5.0/8.0 are small; 18.0 clearly worse).
+
+**Deliberate limitation — Murray-style low-sample QB elevation:** `low_sample` flag fires correctly but magnitude stays elevated because `proj_games` comes from depth-chart rank (QB1 → 16 games), not from 2025 games played. Rate shrinkage helps; the games-played extrapolation does not. Revisit separately via games-played projection logic, not by tuning `SHRINKAGE_STRENGTH`.
+
+**Infra:** bulk season-game fetch (`fetch_season_games_by_player`) + one-time context load for calibration sweeps; PostgREST timeout raised to 120s. Review script: `scoring/draft_edge_calibration_review.py` (read-only, no `edge_scores` writes).
+
+**Re-run:** `compute_and_write_draft_edge()` executed with `SHRINKAGE_STRENGTH=6.0`; `edge_scores` updated for `period=2026-draftedge`.
+
 ---
 
 ## STILL AHEAD (Phase 4 remaining, then onward — order matters)

@@ -63,7 +63,9 @@ from scoring.season_stats import (
     LEAGUE_MEAN_WR_TE_REC_TD_RATE,
     MIN_SEASON_GAMES,
     MIN_SEASON_SAMPLE,
+    _lookup_baseline,
     season_regressed_rate,
+    season_regressed_stat,
 )
 
 # ---- Depth-chart-implied role priors (Task 2's "adjusted by current
@@ -155,6 +157,8 @@ def build_draft_qb_features(
     season_totals: dict,
     depth_chart_rank: int | None,
     context_changed: bool,
+    baselines: dict | None = None,
+    shrinkage_strength: float | None = None,
 ) -> dict:
     """
     QB has no shared "pool" to split -- role is "will this player be the
@@ -173,13 +177,44 @@ def build_draft_qb_features(
 
     proj_games = _depth_chart_tier(depth_chart_rank, QB_GAMES_ESTIMATE_PRIOR, DEFAULT_QB_GAMES_ESTIMATE)
 
-    attempts_per_game = attempts / games_played
-    rush_attempts_per_game = rush_attempts / games_played
+    attempts_per_game_raw = attempts / games_played
+    rush_attempts_per_game_raw = rush_attempts / games_played
+    ypa_raw = (pass_yards / attempts) if attempts > 0 else 0.0
+    ypc_raw = (rush_yards / rush_attempts) if rush_attempts > 0 else 0.0
+
+    if baselines:
+        attempts_per_game = season_regressed_stat(
+            attempts_per_game_raw,
+            _lookup_baseline(baselines, "QB", depth_chart_rank, "attempts_per_game", attempts_per_game_raw),
+            games_played,
+            shrinkage_strength,
+        )
+        rush_attempts_per_game = season_regressed_stat(
+            rush_attempts_per_game_raw,
+            _lookup_baseline(baselines, "QB", depth_chart_rank, "rush_attempts_per_game", rush_attempts_per_game_raw),
+            games_played,
+            shrinkage_strength,
+        )
+        ypa = season_regressed_stat(
+            ypa_raw,
+            _lookup_baseline(baselines, "QB", depth_chart_rank, "ypa", ypa_raw),
+            games_played,
+            shrinkage_strength,
+        )
+        ypc = season_regressed_stat(
+            ypc_raw,
+            _lookup_baseline(baselines, "QB", depth_chart_rank, "ypc", ypc_raw),
+            games_played,
+            shrinkage_strength,
+        )
+    else:
+        attempts_per_game = attempts_per_game_raw
+        rush_attempts_per_game = rush_attempts_per_game_raw
+        ypa = ypa_raw
+        ypc = ypc_raw
+
     proj_pass_attempts = attempts_per_game * proj_games
     proj_rush_attempts = rush_attempts_per_game * proj_games
-
-    ypa = (pass_yards / attempts) if attempts > 0 else 0.0
-    ypc = (rush_yards / rush_attempts) if rush_attempts > 0 else 0.0
 
     td_rate = season_regressed_rate(pass_tds, attempts, LEAGUE_MEAN_PASS_TD_RATE, "qb_pass_td")
     int_rate = season_regressed_rate(pass_ints, attempts, LEAGUE_MEAN_INT_RATE, "qb_int")
@@ -217,6 +252,8 @@ def build_draft_rb_features(
     share_denominator_team_totals: dict,
     depth_chart_rank: int | None,
     context_changed: bool,
+    baselines: dict | None = None,
+    shrinkage_strength: float | None = None,
 ) -> dict:
     """
     Two different teams' 2025 season totals go in here, deliberately kept
@@ -261,12 +298,50 @@ def build_draft_rb_features(
     # pace -- there's no odds/game-script signal to adjust it with yet
     # (no 2026 market data exists this far out; expected per scope notes),
     # so "last year's team pace persists" is the v1 assumption.
-    proj_carries = rush_share * proj_team_carries_season
-    proj_targets = target_share * proj_team_attempts_season
+    proj_carries_raw = rush_share * proj_team_carries_season
+    proj_targets_raw = target_share * proj_team_attempts_season
 
-    ypc = (rush_yards / carries) if carries > 0 else 0.0
-    catch_rate = (receptions / targets) if targets > 0 else 0.0
-    ypt = (rec_yards / targets) if targets > 0 else 0.0
+    ypc_raw = (rush_yards / carries) if carries > 0 else 0.0
+    catch_rate_raw = (receptions / targets) if targets > 0 else 0.0
+    ypt_raw = (rec_yards / targets) if targets > 0 else 0.0
+
+    if baselines:
+        proj_carries = season_regressed_stat(
+            proj_carries_raw,
+            _lookup_baseline(baselines, "RB", depth_chart_rank, "carries", proj_carries_raw),
+            games_played,
+            shrinkage_strength,
+        )
+        proj_targets = season_regressed_stat(
+            proj_targets_raw,
+            _lookup_baseline(baselines, "RB", depth_chart_rank, "targets", proj_targets_raw),
+            games_played,
+            shrinkage_strength,
+        )
+        ypc = season_regressed_stat(
+            ypc_raw,
+            _lookup_baseline(baselines, "RB", depth_chart_rank, "ypc", ypc_raw),
+            games_played,
+            shrinkage_strength,
+        )
+        catch_rate = season_regressed_stat(
+            catch_rate_raw,
+            _lookup_baseline(baselines, "RB", depth_chart_rank, "catch_rate", catch_rate_raw),
+            games_played,
+            shrinkage_strength,
+        )
+        ypt = season_regressed_stat(
+            ypt_raw,
+            _lookup_baseline(baselines, "RB", depth_chart_rank, "ypt", ypt_raw),
+            games_played,
+            shrinkage_strength,
+        )
+    else:
+        proj_carries = proj_carries_raw
+        proj_targets = proj_targets_raw
+        ypc = ypc_raw
+        catch_rate = catch_rate_raw
+        ypt = ypt_raw
 
     rush_td_rate = season_regressed_rate(rush_tds, carries, LEAGUE_MEAN_RUSH_TD_RATE, "rb_rush_td")
     rec_td_rate = season_regressed_rate(rec_tds, targets, LEAGUE_MEAN_RB_REC_TD_RATE, "rb_rec_td")
@@ -314,6 +389,8 @@ def build_draft_wr_te_features(
     depth_chart_rank: int | None,
     context_changed: bool,
     position: str,
+    baselines: dict | None = None,
+    shrinkage_strength: float | None = None,
 ) -> dict:
     """See build_draft_rb_features's docstring for why two team-totals dicts are needed."""
     games_played = season_totals["games_played"]
@@ -332,11 +409,35 @@ def build_draft_wr_te_features(
     target_share_prior = _depth_chart_tier(depth_chart_rank, prior_table, default_prior)
 
     target_share, target_share_weight = _blended_share(observed_target_share, games_played, target_share_prior, context_changed)
-    proj_targets = target_share * proj_team_attempts_season
+    proj_targets_raw = target_share * proj_team_attempts_season
 
-    catch_rate = (receptions / targets) if targets > 0 else 0.0
-    ypt = (rec_yards / targets) if targets > 0 else 0.0
+    catch_rate_raw = (receptions / targets) if targets > 0 else 0.0
+    ypt_raw = (rec_yards / targets) if targets > 0 else 0.0
     adot = (air_yards / targets) if targets > 0 else 0.0
+
+    if baselines:
+        proj_targets = season_regressed_stat(
+            proj_targets_raw,
+            _lookup_baseline(baselines, position, depth_chart_rank, "targets", proj_targets_raw),
+            games_played,
+            shrinkage_strength,
+        )
+        catch_rate = season_regressed_stat(
+            catch_rate_raw,
+            _lookup_baseline(baselines, position, depth_chart_rank, "catch_rate", catch_rate_raw),
+            games_played,
+            shrinkage_strength,
+        )
+        ypt = season_regressed_stat(
+            ypt_raw,
+            _lookup_baseline(baselines, position, depth_chart_rank, "ypt", ypt_raw),
+            games_played,
+            shrinkage_strength,
+        )
+    else:
+        proj_targets = proj_targets_raw
+        catch_rate = catch_rate_raw
+        ypt = ypt_raw
 
     rec_td_rate = season_regressed_rate(rec_tds, targets, LEAGUE_MEAN_WR_TE_REC_TD_RATE, "wr_te_rec_td")
 
@@ -370,6 +471,8 @@ def build_draft_kicker_features(
     season_totals: dict,
     depth_chart_rank: int | None,
     context_changed: bool,
+    baselines: dict | None = None,
+    shrinkage_strength: float | None = None,
 ) -> dict:
     games_played = season_totals["games_played"]
     fg_att = season_totals["fg_att"]
@@ -378,9 +481,33 @@ def build_draft_kicker_features(
 
     proj_games = _depth_chart_tier(depth_chart_rank, K_GAMES_ESTIMATE_PRIOR, DEFAULT_K_GAMES_ESTIMATE)
 
-    fg_att_per_game = fg_att / games_played
-    pat_att_per_game = pat_att / games_played
-    fg_accuracy = (fg_made / fg_att) if fg_att > 0 else 0.80
+    fg_att_per_game_raw = fg_att / games_played
+    pat_att_per_game_raw = pat_att / games_played
+    fg_accuracy_raw = (fg_made / fg_att) if fg_att > 0 else 0.80
+
+    if baselines:
+        fg_att_per_game = season_regressed_stat(
+            fg_att_per_game_raw,
+            _lookup_baseline(baselines, "K", depth_chart_rank, "fg_att_per_game", fg_att_per_game_raw),
+            games_played,
+            shrinkage_strength,
+        )
+        pat_att_per_game = season_regressed_stat(
+            pat_att_per_game_raw,
+            _lookup_baseline(baselines, "K", depth_chart_rank, "pat_att_per_game", pat_att_per_game_raw),
+            games_played,
+            shrinkage_strength,
+        )
+        fg_accuracy = season_regressed_stat(
+            fg_accuracy_raw,
+            _lookup_baseline(baselines, "K", depth_chart_rank, "fg_accuracy", fg_accuracy_raw),
+            games_played,
+            shrinkage_strength,
+        )
+    else:
+        fg_att_per_game = fg_att_per_game_raw
+        pat_att_per_game = pat_att_per_game_raw
+        fg_accuracy = fg_accuracy_raw
 
     proj_fg_attempts = fg_att_per_game * proj_games
     proj_fg_made = proj_fg_attempts * fg_accuracy

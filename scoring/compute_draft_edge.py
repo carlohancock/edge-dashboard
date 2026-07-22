@@ -32,10 +32,20 @@ same UNIQUE(player_id, score_type, period) upsert path added in Phase 4.7
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from config.supabase_client import get_supabase_client
-from scoring.season_stats import aggregate_skill_season_totals, fetch_player_season_games, fetch_team_season_totals, primary_team_id
+from scoring.season_stats import (
+    MIN_SEASON_GAMES,
+    aggregate_skill_season_totals,
+    build_position_role_baselines,
+    collect_raw_observed_stats,
+    fetch_player_season_games,
+    fetch_season_games_by_player,
+    fetch_team_season_totals,
+    primary_team_id,
+)
 from scoring.draft_edge_features import (
     build_draft_kicker_features,
     build_draft_qb_features,
@@ -122,12 +132,57 @@ def _fetch_adp_by_player(client) -> dict[str, float]:
     return {pid: adp for pid, (_, adp) in latest.items()}
 
 
-def _team_season_totals_by_team(client, def_player_by_team: dict[str, str]) -> dict[str, dict]:
+def _team_season_totals_by_team(
+    client,
+    def_player_by_team: dict[str, str],
+    season_games_by_player: dict[str, list[dict]] | None = None,
+) -> dict[str, dict]:
     """2025 season rush/pass attempt totals for every team, keyed by team_id (used as the shared RB/WR/TE volume baseline)."""
     totals: dict[str, dict] = {}
     for team_id, def_player_id in def_player_by_team.items():
-        totals[team_id] = fetch_team_season_totals(client, def_player_id, BASE_SEASON)
+        if season_games_by_player is not None:
+            rows = season_games_by_player.get(def_player_id, [])
+            agg = aggregate_skill_season_totals(rows)
+            totals[team_id] = {
+                "carries": agg["carries"],
+                "attempts": agg["attempts"],
+                "games_played": agg["games_played"],
+            }
+        else:
+            totals[team_id] = fetch_team_season_totals(client, def_player_id, BASE_SEASON)
     return totals
+
+
+@dataclass
+class DraftEdgeContext:
+    """Pre-fetched inputs shared across shrinkage-strength sweeps (calibration review)."""
+
+    players: list[dict]
+    team_totals_by_team: dict[str, dict]
+    adp_by_player: dict[str, float]
+    season_games_by_player: dict[str, list[dict]]
+    baselines: dict
+
+
+def load_draft_edge_context(client) -> DraftEdgeContext:
+    """Fetch draft-pool + 2025 season data once; reuse for multiple projection passes."""
+    players = _fetch_draft_pool(client)
+    def_player_by_team = _get_def_player_by_team(client)
+    season_games_by_player = fetch_season_games_by_player(client, BASE_SEASON)
+    team_totals_by_team = _team_season_totals_by_team(
+        client, def_player_by_team, season_games_by_player,
+    )
+    adp_by_player = _fetch_adp_by_player(client)
+    baselines = _build_role_baselines(
+        client, players, team_totals_by_team, season_games_by_player,
+    )
+    return DraftEdgeContext(
+        players=players,
+        team_totals_by_team=team_totals_by_team,
+        adp_by_player=adp_by_player,
+        season_games_by_player=season_games_by_player,
+        baselines=baselines,
+    )
 
 
 def _empty_team_totals() -> dict:
@@ -138,6 +193,9 @@ def compute_player_draft_projection(
     client,
     player: dict,
     team_totals_by_team: dict[str, dict],
+    baselines: dict | None = None,
+    shrinkage_strength: float | None = None,
+    season_rows: list[dict] | None = None,
 ) -> dict | None:
     """
     Returns {"points": float, "features": dict} for a player WITH 2025
@@ -149,7 +207,10 @@ def compute_player_draft_projection(
     current_team_id = player["team_id"]
     depth_chart_rank = player.get("depth_chart_rank")
 
-    rows = fetch_player_season_games(client, player["player_id"], BASE_SEASON)
+    if season_rows is None:
+        rows = fetch_player_season_games(client, player["player_id"], BASE_SEASON)
+    else:
+        rows = season_rows
     season_totals = aggregate_skill_season_totals(rows)
     if season_totals["games_played"] == 0:
         return None
@@ -158,7 +219,9 @@ def compute_player_draft_projection(
     context_changed = bool(primary_2025_team_id and current_team_id and primary_2025_team_id != current_team_id)
 
     if position == "QB":
-        features = build_draft_qb_features(season_totals, depth_chart_rank, context_changed)
+        features = build_draft_qb_features(
+            season_totals, depth_chart_rank, context_changed, baselines, shrinkage_strength,
+        )
         points = calculate_qb_points(features)
 
     elif position == "RB":
@@ -166,6 +229,7 @@ def compute_player_draft_projection(
         share_team_totals = team_totals_by_team.get(primary_2025_team_id, _empty_team_totals())
         features = build_draft_rb_features(
             season_totals, current_team_totals, share_team_totals, depth_chart_rank, context_changed,
+            baselines, shrinkage_strength,
         )
         points = calculate_rb_points(features)
 
@@ -174,11 +238,14 @@ def compute_player_draft_projection(
         share_team_totals = team_totals_by_team.get(primary_2025_team_id, _empty_team_totals())
         features = build_draft_wr_te_features(
             season_totals, current_team_totals, share_team_totals, depth_chart_rank, context_changed, position,
+            baselines, shrinkage_strength,
         )
         points = calculate_wr_te_points(features)
 
     elif position == "K":
-        features = build_draft_kicker_features(season_totals, depth_chart_rank, context_changed)
+        features = build_draft_kicker_features(
+            season_totals, depth_chart_rank, context_changed, baselines, shrinkage_strength,
+        )
         points = calculate_kicker_points(features)
 
     else:
@@ -237,29 +304,74 @@ def _build_placeholder_projection(
     }
 
 
-def compute_and_write_draft_edge() -> None:
-    client = get_supabase_client()
+def _build_role_baselines(
+    client,
+    players: list[dict],
+    team_totals_by_team: dict[str, dict],
+    season_games_by_player: dict[str, list[dict]] | None = None,
+) -> dict:
+    """Collect 2025 raw observed stats (MIN_SEASON_GAMES+) and build trimmed-mean baselines."""
+    observed_samples: list[tuple[str, int | None, dict[str, float]]] = []
 
-    players = _fetch_draft_pool(client)
-    def_player_by_team = _get_def_player_by_team(client)
-    team_totals_by_team = _team_season_totals_by_team(client, def_player_by_team)
-    adp_by_player = _fetch_adp_by_player(client)
+    for player in players:
+        if season_games_by_player is not None:
+            rows = season_games_by_player.get(player["player_id"], [])
+        else:
+            rows = fetch_player_season_games(client, player["player_id"], BASE_SEASON)
+        season_totals = aggregate_skill_season_totals(rows)
+        if season_totals["games_played"] < MIN_SEASON_GAMES:
+            continue
 
-    print(f"Draft pool: {len(players)} players across {DRAFT_POSITIONS}.")
+        position = player["position"]
+        primary_2025_team_id = primary_team_id(season_totals["team_ids_seen"])
+        share_team_totals = team_totals_by_team.get(primary_2025_team_id, _empty_team_totals())
 
-    # Pass 1: real projections for anyone with 2025 history; collect the rest for the placeholder pass.
+        raw = collect_raw_observed_stats(season_totals, position, share_team_totals)
+        if raw:
+            observed_samples.append((position, player.get("depth_chart_rank"), raw))
+
+    return build_position_role_baselines(observed_samples)
+
+
+def compute_draft_edge_projections(
+    shrinkage_strength: float | None = None,
+    context: DraftEdgeContext | None = None,
+) -> tuple[list[dict], dict[str, dict], dict[str, float]]:
+    """
+    Full Draft Edge compute pass without writing to edge_scores.
+    Returns (players, all_projections_by_pid, adp_by_player).
+
+    Pass a pre-loaded `context` to skip Supabase fetches (used by the
+    shrinkage calibration review, which sweeps three strengths).
+    """
+    if context is None:
+        client = get_supabase_client()
+        context = load_draft_edge_context(client)
+    else:
+        client = None
+
+    players = context.players
+    team_totals_by_team = context.team_totals_by_team
+    adp_by_player = context.adp_by_player
+    season_games_by_player = context.season_games_by_player
+    baselines = context.baselines
+
     real_by_pid: dict[str, dict] = {}
     placeholder_pids: list[str] = []
     for player in players:
-        proj = compute_player_draft_projection(client, player, team_totals_by_team)
+        proj = compute_player_draft_projection(
+            client,
+            player,
+            team_totals_by_team,
+            baselines,
+            shrinkage_strength,
+            season_rows=season_games_by_player.get(player["player_id"], []),
+        )
         if proj is None:
             placeholder_pids.append(player["player_id"])
         else:
             real_by_pid[player["player_id"]] = {**proj, "position": player["position"]}
 
-    print(f"Real (2025-history-based) projections: {len(real_by_pid)}. No-historical-data placeholders needed: {len(placeholder_pids)}.")
-
-    # Pass 2: ADP-anchored placeholders (Task 2's rookie/no-data handling + Task 3's ADP use).
     real_points_by_position: dict[str, list[tuple[float, float]]] = {}
     for pid, proj in real_by_pid.items():
         adp_value = adp_by_player.get(pid)
@@ -275,7 +387,20 @@ def compute_and_write_draft_edge() -> None:
         placeholder = _build_placeholder_projection(position, adp_by_player.get(pid), real_points_by_position)
         all_projections[pid] = {**placeholder, "position": position}
 
-    # Pass 3: per-position rank, scarcity (Task 4a), ADP value gap (Task 4b).
+    return players, all_projections, adp_by_player
+
+
+def compute_and_write_draft_edge() -> None:
+    client = get_supabase_client()
+
+    players, all_projections, adp_by_player = compute_draft_edge_projections()
+
+    print(f"Draft pool: {len(players)} players across {DRAFT_POSITIONS}.")
+    real_count = sum(
+        1 for proj in all_projections.values()
+        if not proj["features"].get("no_historical_data")
+    )
+    print(f"Real (2025-history-based) projections: {real_count}. No-historical-data placeholders needed: {len(players) - real_count}.")
     by_position: dict[str, list[str]] = {}
     for pid, proj in all_projections.items():
         by_position.setdefault(proj["position"], []).append(pid)
@@ -286,7 +411,20 @@ def compute_and_write_draft_edge() -> None:
     for position, pids in by_position.items():
         sorted_by_points = sorted(pids, key=lambda pid: all_projections[pid]["points"], reverse=True)
         n = len(sorted_by_points)
-        points_list = [all_projections[pid]["points"] for pid in sorted_by_points]
+
+        # Scarcity gaps use REAL projections only — ADP placeholders (no_historical_data)
+        # sit out of the chain so interpolated mid-tier points don't inject artificial
+        # near-zero gaps between their ranked neighbors. Placeholders get null scarcity.
+        real_sorted = [
+            pid for pid in sorted_by_points
+            if not all_projections[pid]["features"].get("no_historical_data")
+        ]
+        real_points = [all_projections[pid]["points"] for pid in real_sorted]
+        real_scarcity_by_pid: dict[str, float | None] = {}
+        for idx, pid in enumerate(real_sorted):
+            real_scarcity_by_pid[pid] = (
+                real_points[idx] - real_points[idx + 1] if idx + 1 < len(real_sorted) else 0.0
+            )
 
         # ADP positional rank -- only among players who actually have an ADP.
         pids_with_adp = [pid for pid in pids if adp_by_player.get(pid) is not None]
@@ -295,9 +433,8 @@ def compute_and_write_draft_edge() -> None:
 
         for rank, pid in enumerate(sorted_by_points):
             positional_rank = rank + 1
-            # Scarcity: point gap to the next-ranked player at this position (Task 4a: "simple
-            # version is fine for v1" -- deliberately not modeling anything beyond this one gap).
-            scarcity = points_list[rank] - points_list[rank + 1] if rank + 1 < n else 0.0
+            is_placeholder = all_projections[pid]["features"].get("no_historical_data")
+            scarcity = None if is_placeholder else real_scarcity_by_pid.get(pid)
 
             adp_positional_rank = adp_rank_by_pid.get(pid)
             adp_value_gap = (
@@ -308,7 +445,7 @@ def compute_and_write_draft_edge() -> None:
             factor_breakdown = {
                 **proj["features"],
                 "projected_points": round(proj["points"], 2),
-                "scarcity_gap_to_next_rank": round(scarcity, 2),
+                "scarcity_gap_to_next_rank": round(scarcity, 2) if scarcity is not None else None,
                 "adp_value": adp_by_player.get(pid),
                 "adp_positional_rank": adp_positional_rank,
                 # your_projected_positional_rank - adp_positional_rank (edge_formula_nfl.md /

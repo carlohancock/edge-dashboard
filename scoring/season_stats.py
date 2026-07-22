@@ -92,6 +92,225 @@ MIN_SEASON_SAMPLE = {
 }
 MIN_SEASON_GAMES = 6  # fewer games played than this in 2025 -> low_sample, regardless of volume
 
+# Single tunable knob for volume/efficiency/per-game-rate shrinkage (Task 3).
+# TD-rate shrinkage keeps its own SEASON_TD_RATE_K table above — not controlled here.
+# Override temporarily (e.g. calibration review script) to compare strengths before committing.
+SHRINKAGE_STRENGTH = 6.0  # locked via top-30 RB Spearman vs 2025 actuals (see PROJECT_LOG Phase 5 calibration)
+
+# Fraction trimmed from each tail when building position-role baselines (Task 2).
+BASELINE_TRIM_FRACTION = 0.10
+
+
+def season_regressed_stat(
+    observed: float,
+    baseline: float,
+    games_played: int,
+    shrinkage_strength: float | None = None,
+) -> float:
+    """
+    Empirical-Bayes shrinkage for a scalar stat (volume, efficiency, or per-game rate).
+
+    Weight on the player's observed value grows with 2025 games played (thin samples
+    like Murray's 5 GP pull hard toward baseline). Effective pseudo-count also grows
+    with relative distance from baseline so outlier seasons (McCaffrey carry volume)
+    regress more than median-starter seasons — same spirit as season_regressed_rate()
+    but generalized beyond count/attempt TD rates.
+
+    Formula (posterior-mean form): (observed * n + k_eff * baseline) / (n + k_eff)
+    where n = games_played and k_eff = shrinkage_strength * (1 + relative_distance).
+    """
+    if shrinkage_strength is None:
+        shrinkage_strength = SHRINKAGE_STRENGTH
+
+    n = max(games_played, 0)
+    if n == 0:
+        return baseline
+
+    scale = max(abs(baseline), 1e-6)
+    relative_distance = abs(observed - baseline) / scale
+    k_eff = shrinkage_strength * (1.0 + relative_distance)
+
+    return (observed * n + k_eff * baseline) / (n + k_eff)
+
+
+def _trimmed_mean(values: list[float], trim_fraction: float = BASELINE_TRIM_FRACTION) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    sorted_vals = sorted(values)
+    trim = int(len(sorted_vals) * trim_fraction)
+    if len(sorted_vals) - 2 * trim < 1:
+        return sorted_vals[len(sorted_vals) // 2]
+    trimmed = sorted_vals[trim : len(sorted_vals) - trim]
+    return sum(trimmed) / len(trimmed)
+
+
+def _baseline_key(position: str, depth_chart_rank: int | None, metric: str) -> tuple[str, int | None, str]:
+    return (position, depth_chart_rank, metric)
+
+
+def _lookup_baseline(
+    baselines: dict[tuple[str, int | None, str], float],
+    position: str,
+    depth_chart_rank: int | None,
+    metric: str,
+    fallback: float,
+) -> float:
+    """Rank-specific baseline, then position-wide (rank=None), then caller fallback."""
+    if depth_chart_rank is not None:
+        val = baselines.get(_baseline_key(position, depth_chart_rank, metric))
+        if val is not None:
+            return val
+    val = baselines.get(_baseline_key(position, None, metric))
+    return val if val is not None else fallback
+
+
+def collect_raw_observed_stats(
+    season_totals: dict,
+    position: str,
+    share_denominator_team_totals: dict | None = None,
+) -> dict[str, float]:
+    """
+    Raw 2025 observed rates/volumes BEFORE any shrinkage — used only to build
+    position-role baselines, never as projection inputs directly.
+    """
+    games = season_totals["games_played"]
+    if games == 0:
+        return {}
+
+    if position == "QB":
+        attempts = season_totals["attempts"]
+        rush_attempts = season_totals["carries"]
+        return {
+            "attempts_per_game": attempts / games,
+            "rush_attempts_per_game": rush_attempts / games,
+            "ypa": (season_totals["passing_yards"] / attempts) if attempts > 0 else 0.0,
+            "ypc": (season_totals["rushing_yards"] / rush_attempts) if rush_attempts > 0 else 0.0,
+        }
+
+    if position == "RB":
+        carries = season_totals["carries"]
+        targets = season_totals["targets"]
+        receptions = season_totals["receptions"]
+        rec_yards = season_totals["receiving_yards"]
+        team_carries = share_denominator_team_totals.get("carries") if share_denominator_team_totals else None
+        team_attempts = share_denominator_team_totals.get("attempts") if share_denominator_team_totals else None
+        share_gp = share_denominator_team_totals.get("games_played") or 0 if share_denominator_team_totals else 0
+        team_carries_season = (
+            (team_carries / share_gp) * GAMES_IN_SEASON if team_carries and share_gp else None
+        )
+        team_attempts_season = (
+            (team_attempts / share_gp) * GAMES_IN_SEASON if team_attempts and share_gp else None
+        )
+        return {
+            "carries": carries,
+            "targets": targets,
+            "ypc": (season_totals["rushing_yards"] / carries) if carries > 0 else 0.0,
+            "catch_rate": (receptions / targets) if targets > 0 else 0.0,
+            "ypt": (rec_yards / targets) if targets > 0 else 0.0,
+            "rush_share": (carries / team_carries_season) if team_carries_season else 0.0,
+            "target_share": (targets / team_attempts_season) if team_attempts_season else 0.0,
+        }
+
+    if position in ("WR", "TE"):
+        targets = season_totals["targets"]
+        receptions = season_totals["receptions"]
+        rec_yards = season_totals["receiving_yards"]
+        team_attempts = share_denominator_team_totals.get("attempts") if share_denominator_team_totals else None
+        share_gp = share_denominator_team_totals.get("games_played") or 0 if share_denominator_team_totals else 0
+        team_attempts_season = (
+            (team_attempts / share_gp) * GAMES_IN_SEASON if team_attempts and share_gp else None
+        )
+        return {
+            "targets": targets,
+            "catch_rate": (receptions / targets) if targets > 0 else 0.0,
+            "ypt": (rec_yards / targets) if targets > 0 else 0.0,
+            "target_share": (targets / team_attempts_season) if team_attempts_season else 0.0,
+        }
+
+    if position == "K":
+        fg_att = season_totals["fg_att"]
+        fg_made = season_totals["fg_made"]
+        pat_att = season_totals["pat_att"]
+        return {
+            "fg_att_per_game": fg_att / games,
+            "pat_att_per_game": pat_att / games,
+            "fg_accuracy": (fg_made / fg_att) if fg_att > 0 else 0.80,
+        }
+
+    return {}
+
+
+def build_position_role_baselines(
+    observed_by_player: list[tuple[str, int | None, dict[str, float]]],
+) -> dict[tuple[str, int | None, str], float]:
+    """
+    Robust position-role baselines for shrinkage targets (Task 2).
+
+    Computed from trimmed means (10% each tail) of 2025 RAW observed season stats
+    among players with games_played >= MIN_SEASON_GAMES, grouped by position and
+    depth_chart_rank. Position-wide (rank=None) fallbacks use the same trimmed mean
+    across all ranks at that position. NOT derived from projected fantasy points or
+    from the unregressed Draft Edge outputs being corrected — only from prior-season
+    counting/rate stats, so outlier projections cannot contaminate their own baseline.
+    """
+    # bucket[(position, rank)][metric] -> list of raw observed values
+    by_rank: dict[tuple[str, int | None], dict[str, list[float]]] = {}
+    by_position: dict[str, dict[str, list[float]]] = {}
+
+    for position, rank, metrics in observed_by_player:
+        for metric, value in metrics.items():
+            by_rank.setdefault((position, rank), {}).setdefault(metric, []).append(value)
+            by_position.setdefault(position, {}).setdefault(metric, []).append(value)
+
+    baselines: dict[tuple[str, int | None, str], float] = {}
+    for (position, rank), metric_lists in by_rank.items():
+        for metric, values in metric_lists.items():
+            mean = _trimmed_mean(values)
+            if mean is not None:
+                baselines[(position, rank, metric)] = mean
+
+    for position, metric_lists in by_position.items():
+        for metric, values in metric_lists.items():
+            mean = _trimmed_mean(values)
+            if mean is not None:
+                baselines[(position, None, metric)] = mean
+
+    return baselines
+
+
+PAGE_SIZE = 1000  # PostgREST's default per-request row cap
+
+
+def fetch_season_games_by_player(client, season: int) -> dict[str, list[dict]]:
+    """
+    All player_game_stats rows for `season`, grouped by player_id and sorted
+    oldest-first by week. Paginated so we never hit PostgREST's silent 1000-row
+    truncation. Used by compute_draft_edge to avoid one HTTP round-trip per
+    draft-pool player (~991 calls × 2 passes = the main source of review timeouts).
+    """
+    by_player: dict[str, list[dict]] = {}
+    offset = 0
+    while True:
+        result = (
+            client.table("player_game_stats")
+            .select("player_id, stats, game_id, team_id, games!inner(season, week_or_date)")
+            .eq("games.season", season)
+            .range(offset, offset + PAGE_SIZE - 1)
+            .execute()
+        )
+        rows = result.data or []
+        for row in rows:
+            by_player.setdefault(row["player_id"], []).append(row)
+        if len(rows) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+
+    for player_rows in by_player.values():
+        player_rows.sort(key=lambda r: int(r["games"]["week_or_date"]))
+    return by_player
+
 
 def fetch_player_season_games(client, player_id: str, season: int) -> list[dict]:
     """
