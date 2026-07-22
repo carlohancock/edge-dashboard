@@ -782,4 +782,25 @@ def run_shrinkage_calibration_review(
 
 
 if __name__ == "__main__":
-    compute_and_write_draft_edge()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Draft Edge scoring pipeline")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--review",
+        action="store_true",
+        help="RB shrinkage calibration sweep (read-only, no edge_scores writes)",
+    )
+    mode.add_argument(
+        "--qb-diag",
+        action="store_true",
+        help="Four-QB shrinkage diagnostic (read-only, no edge_scores writes)",
+    )
+    args = parser.parse_args()
+
+    if args.review:
+        run_shrinkage_calibration_review()
+    elif args.qb_diag:
+        print_qb_shrinkage_diagnostic()
+    else:
+        compute_and_write_draft_edge()

@@ -424,7 +424,7 @@ All five correctly flagged — not silently mis-projected as if still on their 2
 
 **Deliberate limitation — Murray-style low-sample QB elevation:** `low_sample` flag fires correctly but magnitude stays elevated because `proj_games` comes from depth-chart rank (QB1 → 16 games), not from 2025 games played. Rate shrinkage helps; the games-played extrapolation does not. Revisit separately via games-played projection logic, not by tuning `SHRINKAGE_STRENGTH`.
 
-**Infra:** bulk season-game fetch (`fetch_season_games_by_player`) + one-time context load for calibration sweeps; PostgREST timeout raised to 120s. Review script: `scoring/draft_edge_calibration_review.py` (read-only, no `edge_scores` writes).
+**Infra:** bulk season-game fetch (`fetch_season_games_by_player`) + one-time context load for calibration sweeps; PostgREST timeout raised to 120s. Read-only review: `python -m scoring.compute_draft_edge --review` (no `edge_scores` writes).
 
 **Re-run:** `compute_and_write_draft_edge()` executed with `SHRINKAGE_STRENGTH=6.0`; `edge_scores` updated for `period=2026-draftedge`.
 
