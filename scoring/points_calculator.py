@@ -8,6 +8,22 @@ from config.league_scoring_rules import LEAGUE_SCORING_RULES as RULES
 from scoring.stats_utils import bucket_bonus, tiered_points
 
 
+def season_totals_to_qb_features(season_totals: dict) -> dict:
+    """Map aggregate_skill_season_totals() keys to calculate_qb_points() input keys."""
+    return {
+        "proj_pass_yards": season_totals["passing_yards"],
+        "proj_pass_tds": season_totals["passing_tds"],
+        "proj_pass_ints": season_totals["passing_interceptions"],
+        "proj_rush_yards": season_totals["rushing_yards"],
+        "proj_rush_tds": season_totals["rushing_tds"],
+    }
+
+
+def calculate_observed_qb_season_points(season_totals: dict) -> float:
+    """2025 ground-truth QB fantasy points under league scoring rules (Phase 5 actuals path)."""
+    return calculate_qb_points(season_totals_to_qb_features(season_totals))
+
+
 def calculate_qb_points(qb_features: dict) -> float:
     r = RULES["passing"]
     yards = qb_features["proj_pass_yards"]

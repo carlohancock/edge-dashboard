@@ -48,6 +48,7 @@ from scoring.season_stats import (
     primary_team_id,
 )
 from scoring.draft_edge_features import (
+    QB_FACTOR_AUDIT_KEYS,
     build_draft_kicker_features,
     build_draft_qb_features,
     build_draft_rb_features,
@@ -55,15 +56,37 @@ from scoring.draft_edge_features import (
 )
 from scoring.points_calculator import (
     calculate_kicker_points,
+    calculate_observed_qb_season_points,
     calculate_qb_points,
     calculate_rb_points,
     calculate_wr_te_points,
 )
+from scoring.stats_utils import projected_to_observed_ratio
 
 SEASON = 2026            # the season being projected/drafted for
 BASE_SEASON = 2025       # the season the projection is BUILT FROM
 DRAFT_POSITIONS = ("QB", "RB", "WR", "TE", "K")
 PERIOD = f"{SEASON}-draftedge"
+SCORE_TYPE = "draft_edge"
+
+# Shrinkage-strength sweep used by run_shrinkage_calibration_review().
+CALIBRATION_SHRINKAGE_STRENGTHS = {
+    "low": 3.0,
+    "moderate": 8.0,
+    "high": 18.0,
+}
+CALIBRATION_SPOTLIGHT_NAMES = (
+    "Christian McCaffrey",
+    "Kyler Murray",
+    "Jeremiyah Love",
+    "Jadarian Price",
+)
+QB_SHRINKAGE_DIAGNOSTIC_NAMES = (
+    "Lamar Jackson",
+    "Josh Allen",
+    "Matthew Stafford",
+    "Jared Goff",
+)
 
 # If a no-historical-data player has no ADP either (undrafted rookie/UDFA
 # with zero market signal at all), place them just below the position's
@@ -462,7 +485,7 @@ def compute_and_write_draft_edge() -> None:
 
             rows_to_upsert.append({
                 "player_id": pid,
-                "score_type": "draft_edge",
+                "score_type": SCORE_TYPE,
                 "period": PERIOD,
                 "score_value": None,
                 "positional_rank": positional_rank,
@@ -476,6 +499,286 @@ def compute_and_write_draft_edge() -> None:
         ).execute()
 
     print(f"Computed and wrote {len(rows_to_upsert)} draft_edge rows for period={PERIOD}.")
+
+
+def find_player_by_name(players: list[dict], name: str) -> dict | None:
+    for player in players:
+        if player["full_name"] == name:
+            return player
+    return None
+
+
+def fetch_players_by_names(client, names: tuple[str, ...] | list[str]) -> dict[str, dict]:
+    result = (
+        client.table("players")
+        .select("player_id, full_name, position, team_id, depth_chart_rank")
+        .eq("sport", "nfl")
+        .in_("full_name", list(names))
+        .execute()
+    )
+    by_name = {row["full_name"]: row for row in (result.data or [])}
+    missing = [name for name in names if name not in by_name]
+    if missing:
+        raise RuntimeError(f"Players not found: {', '.join(missing)}")
+    return by_name
+
+
+def fetch_draft_edge_rows(
+    client,
+    player_ids: list[str],
+    *,
+    period: str = PERIOD,
+    score_type: str = SCORE_TYPE,
+) -> dict[str, dict]:
+    result = (
+        client.table("edge_scores")
+        .select("player_id, factor_breakdown, positional_rank, computed_at")
+        .eq("score_type", score_type)
+        .eq("period", period)
+        .in_("player_id", player_ids)
+        .execute()
+    )
+    by_player = {row["player_id"]: row for row in (result.data or [])}
+    missing = [pid for pid in player_ids if pid not in by_player]
+    if missing:
+        raise RuntimeError(
+            f"No {score_type} row for period={period}: {', '.join(missing)}"
+        )
+    return by_player
+
+
+def rank_players_at_position(
+    players: list[dict],
+    all_projections: dict[str, dict],
+    position: str,
+) -> list[tuple[int, dict, dict]]:
+    """Return (positional_rank, player, projection) tuples sorted by projected points."""
+    players_by_id = {p["player_id"]: p for p in players}
+    pids = [p["player_id"] for p in players if p["position"] == position]
+    sorted_pids = sorted(pids, key=lambda pid: all_projections[pid]["points"], reverse=True)
+    return [
+        (rank + 1, players_by_id[pid], all_projections[pid])
+        for rank, pid in enumerate(sorted_pids)
+    ]
+
+
+def rb10_25_points_slope(ranked_rbs: list[tuple[int, dict, dict]]) -> float:
+    """Average projected-point drop per rank slot across RB10–RB25 (calibration tiebreaker)."""
+    pts = [proj["points"] for rank, _, proj in ranked_rbs if 10 <= rank <= 25]
+    if len(pts) < 2:
+        return 0.0
+    return (pts[0] - pts[-1]) / (len(pts) - 1)
+
+
+def projection_feature_flags(features: dict) -> list[str]:
+    flags = []
+    if features.get("no_historical_data"):
+        flags.append("PLACEHOLDER")
+    if features.get("low_sample"):
+        flags.append("low_sample")
+    if features.get("context_changed"):
+        flags.append("context_changed")
+    return flags
+
+
+def build_qb_shrinkage_diagnostic_rows(
+    client,
+    names: tuple[str, ...] | list[str] = QB_SHRINKAGE_DIAGNOSTIC_NAMES,
+    *,
+    base_season: int = BASE_SEASON,
+    period: str = PERIOD,
+) -> list[dict]:
+    """
+    Compare 2025 observed season totals vs stored Draft Edge factor_breakdown
+    for named QBs. Pure read — no edge_scores writes.
+    """
+    players_by_name = fetch_players_by_names(client, names)
+    player_ids = [players_by_name[name]["player_id"] for name in names]
+    edge_rows = fetch_draft_edge_rows(client, player_ids, period=period)
+
+    rows: list[dict] = []
+    for name in names:
+        player = players_by_name[name]
+        player_id = player["player_id"]
+        game_rows = fetch_player_season_games(client, player_id, base_season)
+        totals = aggregate_skill_season_totals(game_rows)
+        fb = edge_rows[player_id]["factor_breakdown"]
+
+        proj_att = fb.get("proj_pass_attempts")
+        proj_rush_yards = fb.get("proj_rush_yards")
+        proj_rush_tds = fb.get("proj_rush_tds")
+        proj_fp = fb.get("projected_points")
+
+        rows.append({
+            "name": name,
+            "player_id": player_id,
+            "totals": totals,
+            "factor_breakdown": fb,
+            "positional_rank": edge_rows[player_id].get("positional_rank"),
+            "computed_at": edge_rows[player_id].get("computed_at"),
+            "obs_pass_attempts": totals["attempts"],
+            "obs_rush_yards": totals["rushing_yards"],
+            "obs_rush_tds": totals["rushing_tds"],
+            "obs_fp": calculate_observed_qb_season_points(totals),
+            "proj_pass_attempts": proj_att,
+            "proj_rush_yards": proj_rush_yards,
+            "proj_rush_tds": proj_rush_tds,
+            "proj_fp": proj_fp,
+            "att_ratio": projected_to_observed_ratio(proj_att, totals["attempts"]),
+            "rush_yards_ratio": projected_to_observed_ratio(proj_rush_yards, totals["rushing_yards"]),
+            "rush_tds_ratio": projected_to_observed_ratio(proj_rush_tds, totals["rushing_tds"]),
+        })
+    return rows
+
+
+def _format_ratio(ratio: float | None) -> str:
+    if ratio is None:
+        return "N/A"
+    return f"{ratio:.3f}"
+
+
+def print_qb_shrinkage_diagnostic(
+    client=None,
+    names: tuple[str, ...] | list[str] = QB_SHRINKAGE_DIAGNOSTIC_NAMES,
+) -> list[dict]:
+    """Print QB observed-vs-projected audit table; returns structured rows."""
+    if client is None:
+        client = get_supabase_client()
+    diagnostic_rows = build_qb_shrinkage_diagnostic_rows(client, names)
+
+    print(f"QB shrinkage diagnostic — {BASE_SEASON} observed vs Draft Edge ({PERIOD})")
+    print("Read-only: no database writes.\n")
+
+    header = (
+        f"{'Name':<18} "
+        f"{'Obs Att':>8} {'Proj Att':>8} {'Att Ratio':>9} "
+        f"{'Obs RushY':>9} {'Proj RushY':>10} {'RushY Ratio':>11} "
+        f"{'Obs RushTD':>10} {'Proj RushTD':>11} {'RushTD Ratio':>12} "
+        f"{'Obs FP':>8} {'Proj FP':>8} {'GP':>4}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for row in diagnostic_rows:
+        totals = row["totals"]
+        proj_rush_tds = row["proj_rush_tds"]
+        proj_fp = row["proj_fp"]
+        print(
+            f"{row['name']:<18} "
+            f"{row['obs_pass_attempts']:>8.0f} {row['proj_pass_attempts']:>8.1f} "
+            f"{_format_ratio(row['att_ratio']):>9} "
+            f"{row['obs_rush_yards']:>9.0f} {row['proj_rush_yards']:>10.1f} "
+            f"{_format_ratio(row['rush_yards_ratio']):>11} "
+            f"{row['obs_rush_tds']:>10.0f} "
+            f"{(f'{proj_rush_tds:.3f}' if proj_rush_tds is not None else 'N/A'):>11} "
+            f"{_format_ratio(row['rush_tds_ratio']):>12} "
+            f"{row['obs_fp']:>8.1f} {proj_fp if proj_fp is not None else 'N/A':>8} "
+            f"{totals['games_played']:>4.0f}"
+        )
+
+    print("\n2025 observed season totals (player_game_stats, Phase 4.8 team_id backfill)")
+    obs_header = (
+        f"{'Name':<18} {'Pass Att':>8} {'Pass Yds':>9} {'Pass TD':>7} "
+        f"{'Rush Att':>8} {'Rush Yds':>8} {'Rush TD':>7} {'GP':>4}"
+    )
+    print(obs_header)
+    print("-" * len(obs_header))
+    for row in diagnostic_rows:
+        t = row["totals"]
+        print(
+            f"{row['name']:<18} "
+            f"{t['attempts']:>8.0f} {t['passing_yards']:>9.0f} {t['passing_tds']:>7.0f} "
+            f"{t['carries']:>8.0f} {t['rushing_yards']:>8.0f} {t['rushing_tds']:>7.0f} "
+            f"{t['games_played']:>4.0f}"
+        )
+
+    print(f"\nDraft Edge factor_breakdown ({PERIOD}) — projections + shrinkage intermediates")
+    proj_header = (
+        f"{'Name':<18} {'Proj Att':>8} {'Proj Rush Att':>13} {'Proj Rush Yds':>13} "
+        f"{'Proj Rush TDs':>13} {'Proj Pass Yds':>13} {'Proj Pass TDs':>13} "
+        f"{'Pos Rank':>8}"
+    )
+    print(proj_header)
+    print("-" * len(proj_header))
+    for row in diagnostic_rows:
+        fb = row["factor_breakdown"]
+        proj_rush_tds = row["proj_rush_tds"]
+        print(
+            f"{row['name']:<18} "
+            f"{fb.get('proj_pass_attempts', 0):>8.1f} "
+            f"{fb.get('proj_rush_attempts', 0):>13.1f} "
+            f"{fb.get('proj_rush_yards', 0):>13.1f} "
+            f"{(f'{proj_rush_tds:.3f}' if proj_rush_tds is not None else 'N/A'):>13} "
+            f"{fb.get('proj_pass_yards', 0):>13.1f} "
+            f"{fb.get('proj_pass_tds', 0):>13.2f} "
+            f"{row.get('positional_rank', 'N/A'):>8}"
+        )
+
+    print("\nShrinkage / audit fields stored in factor_breakdown")
+    for row in diagnostic_rows:
+        fb = row["factor_breakdown"]
+        print(f"\n  {row['name']}:")
+        for key in QB_FACTOR_AUDIT_KEYS:
+            print(f"    {key}: {fb.get(key)}")
+        print(f"    projected_points: {fb.get('projected_points')}")
+        print(f"    computed_at: {row.get('computed_at')}")
+
+    return diagnostic_rows
+
+
+def run_shrinkage_calibration_review(
+    client=None,
+    strengths: dict[str, float] | None = None,
+    spotlight_names: tuple[str, ...] = CALIBRATION_SPOTLIGHT_NAMES,
+) -> None:
+    """RB shrinkage sweep — read-only, no edge_scores writes."""
+    if client is None:
+        client = get_supabase_client()
+    if strengths is None:
+        strengths = CALIBRATION_SHRINKAGE_STRENGTHS
+
+    print("Loading draft pool + 2025 season data (one-time fetch)...")
+    context = load_draft_edge_context(client)
+    print(f"Loaded {len(context.players)} players.\n")
+
+    for label, strength in strengths.items():
+        print(f"\n{'=' * 72}")
+        print(f"SHRINKAGE_STRENGTH = {strength} ({label})")
+        print("=" * 72)
+
+        players, all_projections, _ = compute_draft_edge_projections(
+            shrinkage_strength=strength,
+            context=context,
+        )
+        ranked_rbs = rank_players_at_position(players, all_projections, "RB")
+
+        print("\nRB1–40 (placeholder = no_historical_data):")
+        print(f"{'Rank':>4}  {'Name':<28} {'Pts':>8}  {'Flags'}")
+        print("-" * 72)
+        for rank, player, proj in ranked_rbs[:40]:
+            flag_str = ", ".join(projection_feature_flags(proj["features"])) or "-"
+            print(f"{rank:>4}  {player['full_name']:<28} {proj['points']:>8.2f}  {flag_str}")
+
+        slope = rb10_25_points_slope(ranked_rbs)
+        print(f"\nRB10–25 avg drop per rank: {slope:.2f} pts")
+
+        print("\nSpotlight players:")
+        for name in spotlight_names:
+            player = find_player_by_name(players, name)
+            if not player:
+                print(f"  {name}: not found in draft pool")
+                continue
+            proj = all_projections[player["player_id"]]
+            pos = player["position"]
+            if pos == "RB":
+                rank = next(r for r, p, _ in ranked_rbs if p["player_id"] == player["player_id"])
+                rank_label = f"RB#{rank}"
+            else:
+                pos_ranked = rank_players_at_position(players, all_projections, pos)
+                rank = next(r for r, p, _ in pos_ranked if p["player_id"] == player["player_id"])
+                rank_label = f"{pos}#{rank}"
+            flags = projection_feature_flags(proj["features"])
+            print(f"  {name}: {rank_label}, {proj['points']:.2f} pts [{', '.join(flags) or 'none'}]")
 
 
 if __name__ == "__main__":

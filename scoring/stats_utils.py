@@ -53,6 +53,15 @@ def regressed_rate(
     return (event_count + k * league_mean_rate) / (attempt_count + k)
 
 
+def projected_to_observed_ratio(numerator: float | None, denominator: float) -> float | None:
+    """Return proj/obs ratio, or None when undefined (missing numerator or zero denominator)."""
+    if numerator is None:
+        return None
+    if denominator == 0:
+        return None
+    return numerator / denominator
+
+
 def bucket_bonus(value: float, tiers: list[dict]) -> float:
     """
     Given a stat value (e.g. passing yards = 320) and a list of tier dicts like:

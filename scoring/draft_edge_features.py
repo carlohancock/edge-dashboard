@@ -100,6 +100,22 @@ DEFAULT_QB_GAMES_ESTIMATE = 0.2
 K_GAMES_ESTIMATE_PRIOR = {1: 17.0, 2: 0.5}
 DEFAULT_K_GAMES_ESTIMATE = 0.1
 
+# Keys persisted in edge_scores.factor_breakdown for QB shrinkage audit / diagnostics.
+QB_FACTOR_AUDIT_KEYS = (
+    "season_2025_games_played",
+    "season_2025_attempts",
+    "season_2025_ypa",
+    "regressed_td_rate",
+    "regressed_int_rate",
+    "regressed_rush_tds_per_game",
+    "qb_rush_td_per_game_prior",
+    "proj_games_2026",
+    "depth_chart_rank",
+    "context_changed",
+    "low_sample",
+    "no_historical_data",
+)
+
 # Team volume fallback if the current 2026 team somehow has zero 2025 DEF
 # history (shouldn't happen post-Phase-3.6, but mirrors compute_edge_scores.py's
 # own DEFAULT_TEAM_*_BASELINE fallback pattern, scaled to a full season).
