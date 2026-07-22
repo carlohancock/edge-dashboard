@@ -139,6 +139,16 @@ preserve historical movement/trend data for future multi-season analysis.
 - Row-Level Security left disabled for this single-user v1 (service-role key
 bypasses it anyway for pipeline writes; flagged as something to revisit if
 multi-user auth is ever added).
+- **Amendment (2026-07-21) — RLS enabled; supersedes the decision above, does not
+  erase it.** The Lovable frontend now connects with the publishable/anon key and
+  needed a real read boundary, not an honor-system "nothing enforced yet." Applied
+  via `sql/enable_rls_anon_select.sql` (rollback: `sql/rollback_rls_anon_select.sql`):
+  RLS enabled on `players`, `teams`, `games`, `edge_scores`, `adp`, `user_roster`,
+  `trades`, `trade_players` with one SELECT-only policy per table for role `anon`
+  (`USING (true)` — fully public read, correct for single-user v1). No INSERT/UPDATE/
+  DELETE policies for `anon`; frontend writes fail as intended. Python pipeline
+  unchanged: `service_role` carries Postgres `BYPASSRLS` per Supabase docs, so
+  pipeline writes ignore RLS entirely.
 - Set up version control (GitHub) with a Python virtual environment, `.env`-based
 secret management (service-role key never exposed to frontend, only the
 publishable/anon key), and connected a frontend (Lovable) with two-way GitHub sync
