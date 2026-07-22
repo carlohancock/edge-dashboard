@@ -14,7 +14,8 @@ from scoring.vegas_features import game_script
 BETA_SCRIPT_QB_ATTEMPTS = 0.15   # how much game_script shifts attempt volume
 LEAGUE_MEAN_TD_RATE = 0.045      # ~4.5% of attempts result in a passing TD, league-wide
 LEAGUE_MEAN_INT_RATE = 0.022     # ~2.2% of attempts result in an INT, league-wide
-TD_RATE_K = 150                  # shrinkage pseudo-count for TD rate
+TD_RATE_K = 150                  # shrinkage pseudo-count for pass TD rate
+QB_RUSH_TD_PER_GAME_K = 8        # weekly mirror of season qb_rush_td_per_game k=15; tunable (Phase 5)
 INT_RATE_K = 150                 # shrinkage pseudo-count for INT rate
 
 
@@ -28,6 +29,7 @@ def build_qb_features(
     team_spread: float,
     opponent_pass_def_factor: float = 1.0,
     half_life: float = 2.5,
+    rush_td_history: list[int] | None = None,
 ) -> dict:
     """
     Computes projected QB features for one upcoming game.
@@ -76,8 +78,21 @@ def build_qb_features(
     baseline_rush_attempts = ewma(rush_attempts_history, half_life)
     total_rush_attempts = sum(rush_attempts_history) if rush_attempts_history else 0
     total_rush_yards = sum(rush_yards_history) if rush_yards_history else 0
+    total_rush_tds = sum(rush_td_history) if rush_td_history else 0
     ypc = (total_rush_yards / total_rush_attempts) if total_rush_attempts > 0 else 0.0
     proj_rush_yards = baseline_rush_attempts * ypc
+
+    games_in_window = len(rush_attempts_history)
+    # Prior loaded from 2025 draft-pool p25 at runtime in Draft Edge; weekly uses the
+    # same documented fallback (0.0 on 2025 pool) until a live baseline is wired here.
+    rush_td_per_game_prior = 0.0
+    rush_tds_per_game = regressed_rate(
+        event_count=total_rush_tds,
+        attempt_count=games_in_window,
+        league_mean_rate=rush_td_per_game_prior,
+        k=QB_RUSH_TD_PER_GAME_K,
+    )
+    proj_rush_tds = rush_tds_per_game
 
     return {
         "proj_pass_attempts": adj_attempts,
@@ -86,5 +101,6 @@ def build_qb_features(
         "proj_pass_ints": proj_pass_ints,
         "proj_rush_attempts": baseline_rush_attempts,
         "proj_rush_yards": proj_rush_yards,
+        "proj_rush_tds": proj_rush_tds,
         "game_script": g,
     }

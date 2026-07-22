@@ -69,6 +69,7 @@ GAMES_IN_SEASON = 17  # NFL regular-season games per team, 2025 and 2026 alike
 # 2025-to-2026 outcome pairs exist to fit k empirically.
 SEASON_TD_RATE_K = {
     "qb_pass_td": 300,    # weekly TD_RATE_K = 150
+    "qb_rush_td_per_game": 15,  # Reasoned starting value — keeps zero-rushing QBs at ~0 (p25=0.0 prior) while letting established rushers retain ~half their observed rush-TD rate; Allen 14 obs → ~7.2 proj. Selected on 4-QB plausibility read, not rank-correlation fit — flag for empirical fit against 2025→2026 outcome pairs alongside SHRINKAGE_STRENGTH.
     "qb_int": 300,        # weekly INT_RATE_K = 150
     "rb_rush_td": 200,    # weekly RUSH_TD_RATE_K = 100
     "rb_rec_td": 120,     # weekly REC_TD_RATE_K = 60
@@ -99,6 +100,11 @@ SHRINKAGE_STRENGTH = 6.0  # locked via top-30 RB Spearman vs 2025 actuals (see P
 
 # Fraction trimmed from each tail when building position-role baselines (Task 2).
 BASELINE_TRIM_FRACTION = 0.10
+
+# QB rush-TD prior percentile for season_regressed_rate(..., "qb_rush_td_per_game").
+# Full QB-population median rush TDs/game (~0.118 on 2025 draft pool) is mobile-QB-
+# skewed; p25 (=0.0 for 2025) anchors pocket passers near zero. Tunable (Phase 5).
+QB_RUSH_TD_PER_GAME_PRIOR_PCTL = 0.25
 
 
 def season_regressed_stat(
@@ -146,6 +152,39 @@ def _trimmed_mean(values: list[float], trim_fraction: float = BASELINE_TRIM_FRAC
     return sum(trimmed) / len(trimmed)
 
 
+def _percentile(sorted_values: list[float], percentile: float) -> float:
+    """Linear-interpolated percentile on a pre-sorted list (0.0–1.0)."""
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    rank = percentile * (len(sorted_values) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = rank - lo
+    return sorted_values[lo] + frac * (sorted_values[hi] - sorted_values[lo])
+
+
+def compute_qb_rush_td_per_game_prior(
+    observed_by_player: list[tuple[str, int | None, dict[str, float]]],
+    percentile: float = QB_RUSH_TD_PER_GAME_PRIOR_PCTL,
+) -> float:
+    """
+    Data-derived prior for QB rush TDs per game (season_regressed_rate denominator =
+    games_played, not carries). Default: p25 of 2025 draft-pool QBs with
+    MIN_SEASON_GAMES+. On the 2025 pool p25=0.0 while the full median is ~0.118
+    (mobile-QB-skewed); p25 keeps observed-zero pocket passers near zero.
+    """
+    values = sorted(
+        metrics["rush_tds_per_game"]
+        for position, _rank, metrics in observed_by_player
+        if position == "QB" and "rush_tds_per_game" in metrics
+    )
+    if not values:
+        return 0.0
+    return _percentile(values, percentile)
+
+
 def _baseline_key(position: str, depth_chart_rank: int | None, metric: str) -> tuple[str, int | None, str]:
     return (position, depth_chart_rank, metric)
 
@@ -185,6 +224,7 @@ def collect_raw_observed_stats(
         return {
             "attempts_per_game": attempts / games,
             "rush_attempts_per_game": rush_attempts / games,
+            "rush_tds_per_game": season_totals["rushing_tds"] / games,
             "ypa": (season_totals["passing_yards"] / attempts) if attempts > 0 else 0.0,
             "ypc": (season_totals["rushing_yards"] / rush_attempts) if rush_attempts > 0 else 0.0,
         }

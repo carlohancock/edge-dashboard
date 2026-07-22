@@ -20,6 +20,7 @@ def calculate_qb_points(qb_features: dict) -> float:
     rr = RULES["rushing"]
     rush_yards = qb_features["proj_rush_yards"]
     points += rush_yards / rr["yards_per_point"]
+    points += qb_features["proj_rush_tds"] * rr["td"]
     points += bucket_bonus(rush_yards, rr["yardage_bonus_tiers"])
 
     return points

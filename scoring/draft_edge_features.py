@@ -174,6 +174,7 @@ def build_draft_qb_features(
     pass_ints = season_totals["passing_interceptions"]
     rush_attempts = season_totals["carries"]
     rush_yards = season_totals["rushing_yards"]
+    rush_tds = season_totals["rushing_tds"]
 
     proj_games = _depth_chart_tier(depth_chart_rank, QB_GAMES_ESTIMATE_PRIOR, DEFAULT_QB_GAMES_ESTIMATE)
 
@@ -218,11 +219,20 @@ def build_draft_qb_features(
 
     td_rate = season_regressed_rate(pass_tds, attempts, LEAGUE_MEAN_PASS_TD_RATE, "qb_pass_td")
     int_rate = season_regressed_rate(pass_ints, attempts, LEAGUE_MEAN_INT_RATE, "qb_int")
+    rush_td_per_game_prior = (
+        _lookup_baseline(baselines, "QB", None, "rush_tds_per_game_prior", 0.0)
+        if baselines
+        else 0.0
+    )
+    rush_tds_per_game = season_regressed_rate(
+        rush_tds, games_played, rush_td_per_game_prior, "qb_rush_td_per_game",
+    )
 
     proj_pass_yards = proj_pass_attempts * ypa
     proj_pass_tds = proj_pass_attempts * td_rate
     proj_pass_ints = proj_pass_attempts * int_rate
     proj_rush_yards = proj_rush_attempts * ypc
+    proj_rush_tds = rush_tds_per_game * proj_games
 
     low_sample = games_played < MIN_SEASON_GAMES or attempts < MIN_SEASON_SAMPLE["pass_attempts"]
 
@@ -233,11 +243,14 @@ def build_draft_qb_features(
         "proj_pass_ints": proj_pass_ints,
         "proj_rush_attempts": proj_rush_attempts,
         "proj_rush_yards": proj_rush_yards,
+        "proj_rush_tds": proj_rush_tds,
         "season_2025_games_played": games_played,
         "season_2025_attempts": attempts,
         "season_2025_ypa": ypa,
         "regressed_td_rate": td_rate,
         "regressed_int_rate": int_rate,
+        "regressed_rush_tds_per_game": rush_tds_per_game,
+        "qb_rush_td_per_game_prior": rush_td_per_game_prior,
         "proj_games_2026": proj_games,
         "depth_chart_rank": depth_chart_rank,
         "context_changed": context_changed,
