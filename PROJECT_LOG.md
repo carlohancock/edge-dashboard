@@ -314,6 +314,32 @@ the real backfilled data actually uses.
 
 ---
 
+## Phase 4.11 — permanent offense Edge scores written (2025-WK12, REAL data)
+
+**Goal:** first **real, permanent** weekly Edge write to `edge_scores` for frontend development — not the Phase 4.7 plumbing test (those rows were deleted; period was `2025-WK12-TEST`). Same underlying offense computation validated read-only in Phase 4.6, now persisted with full `factor_breakdown`.
+
+**Engine changes (`compute_edge_scores.py`, permanent):**
+- **Historical path confirmed before write:** `compute_and_write_edge_scores(period='2025-WK12', season=2025, week=12)` logs `Game lookup: _get_game_for_period(season=2025, week=12) [NOT _get_upcoming_game]` and routes every player through `_get_game_for_period` (Phase 4.9 fix). Spot-checked Justin Jefferson: historical game = 2025 Wk12 (`season=2025`, `week_or_date=12`); live path would have returned 2026 Wk1 — paths are distinct, not silently aliased.
+- **Vegas neutralized for 2025 (Phase 4.9 option b):** when `team_spread` is null (all 2025 games — zero odds rows), spread is forced to `0.0` so game-script features compute at neutral instead of aborting at the spread gate. Every row's `factor_breakdown` includes `vegas_available: false` and `game_script: 0.0` so these scores are never mistaken for a fully vegas-integrated projection once 2026 live odds exist. `vegas_features.py` untouched.
+- **Offense-only filter:** new optional `positions` param; this run used `OFFENSE_POSITIONS = ('QB', 'RB', 'WR', 'TE')` — K and DEF excluded. DST logic is resolved (Phase 4.10) but intentionally not written here; DST weekly scores remain pending the outstanding negative-test check in STILL AHEAD, not because DST formula work is open.
+- **Audit flags on every row:** `factor_breakdown` enriched with `vegas_available`, `low_sample` (<3 prior games in the EWMA window), `no_historical_data` (zero prior games). Weekly Edge does not emit Draft Edge's `context_changed` / `PLACEHOLDER` flags — those are season-long Draft Edge concepts.
+
+**Write:** `period='2025-WK12'` (permanent label, no `-TEST` suffix). Pre-write collision check: 0 existing rows for `(score_type='edge', period='2025-WK12')`. Upsert on `UNIQUE(player_id, score_type, period)` from Phase 4.7 — re-run verified idempotent (831 rows both passes, 831 distinct keys, zero duplicates).
+
+**Result:** **831 offense rows** — QB 115 / RB 178 / WR 349 / TE 189. Zero DEF or K rows. `factor_breakdown` populated on all 831; all rows `vegas_available: false`, all `game_script: 0.0`.
+
+**Spot-check vs Phase 4.6 read-only rankings (same engine, now persisted):**
+| Position | Expected (4.6) | Actual top tier |
+|---|---|---|
+| RB | McCaffrey / Gibbs / Brown near top | ✅ #2 McCaffrey, #5 Gibbs, #4 Chase Brown (among 178 RBs) |
+| WR | JSN / London / Pickens near top | ✅ JSN #6; Drake London #19, George Pickens #31 among WRs with 2025 history — still football-credible (starters above backups) but London/Pickens rank lower than the 4.6 narrative, likely from full-pool percentile sizing (349 WRs scored vs a smaller read-only sample in 4.6) and neutral game-script |
+
+**Known caveats carried forward:** (1) compute-time team resolution still uses `players.team_id`, not per-game `player_game_stats.team_id` (STILL AHEAD item 1) — rare traded-player mis-target possible; (2) EWMA history has no explicit pre-Wk12 leakage cutoff on this write (same as 4.6/4.7 read path — acceptable for frontend seed data, not for leakage-safe backtest); (3) 380 rows flagged `no_historical_data: true` (rostered players with zero prior stat rows still scored at ~0 projection and included in positional percentile pools).
+
+**Not touched (per scope):** DST logic, Draft Edge, `vegas_features.py`, frontend.
+
+---
+
 ## Phase 5 — Draft Edge (season-long positional rankings for 2026 draft)
 
 **Framing:** July 2026, zero 2026 games played. Draft Edge is NOT a trailing-EWMA computation like weekly Edge — it projects each player's 2026 role from their 2025 full-season performance as the base, adjusted by their *current* (2026) team/depth-chart context from the `players` table. Scarcity and ADP value gap replace the per-week matchup factor. No market-blend features (no 2026 odds data this far before the season — expected, not a gap).
@@ -410,8 +436,9 @@ All five correctly flagged — not silently mis-projected as if still on their 2
 2. **2025-odds decision remainder.** Option (b) (odds-free backtest) is now executed for QB/RB/WR/TE/K — see 4.9 results above. Still open: whether to (a) backfill 2025 historical odds to also validate game-script/market-blend/kicker-implied-total against real 2025 data, or (c) defer that validation to live 2026 odds. No code until decided.
 3. **Full leakage-safe backtest, vegas included.** Requires (1) done and (2) resolved. 4.9's non-vegas backtest is a real but partial leakage-safe backtest (proves the harness + opportunity/efficiency math); the game-script/market-blend half is still unvalidated.
 4. ~~**DST review**~~ — RESOLVED, see Phase 4.10 above.
-5. ~~**Draft Edge**~~ — RESOLVED, see Phase 5 above.
-6. **THEN Phase 4 is genuinely done → Lovable frontend**, then EdgeGM, automation, deploy.
+5. ~~**Offense weekly Edge write (2025-WK12 seed data)**~~ — RESOLVED, see Phase 4.11 above. DST weekly scores still excluded pending negative-test check (DST formula itself is done).
+6. ~~**Draft Edge**~~ — RESOLVED, see Phase 5 above.
+7. **THEN Phase 4 is genuinely done → Lovable frontend**, then EdgeGM, automation, deploy.
 
 ---
 

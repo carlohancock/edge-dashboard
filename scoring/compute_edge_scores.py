@@ -35,7 +35,9 @@ from scoring.points_calculator import (
 )
 
 NUM_HISTORY_GAMES = 5
+MIN_HISTORY_GAMES_FULL_SAMPLE = 3  # fewer prior games -> low_sample in factor_breakdown
 LEAGUE_AVG_IMPLIED_TOTAL = 22.0
+OFFENSE_POSITIONS = ("QB", "RB", "WR", "TE")
 
 # Fallbacks used only when a team has no DEF-row history yet (e.g. week 1).
 DEFAULT_TEAM_RUSH_ATTEMPTS_BASELINE = 26.0
@@ -188,14 +190,19 @@ def compute_player_projection(
     is_home = game["home_team_id"] == team_id
     opponent_id = game["away_team_id"] if is_home else game["home_team_id"]
     spread = team_spread(game, team_id)
+    vegas_available = spread is not None
     if spread is None:
-        return None
+        # 2025 has no odds rows — neutralize game-script (Phase 4.9 option b).
+        spread = 0.0
+
+    history_games = 0
 
     if position == "QB":
         hist, _ = _get_stat_history(client, player["player_id"], [
             "attempts", "passing_yards", "passing_tds", "passing_interceptions",
             "carries", "rushing_yards",
         ])
+        history_games = len(hist["attempts"])
         features = build_qb_features(
             hist["attempts"], hist["passing_yards"], hist["passing_tds"], hist["passing_interceptions"],
             hist["carries"], hist["rushing_yards"], spread,
@@ -207,6 +214,7 @@ def compute_player_projection(
             "carries", "rushing_yards", "receiving_yards", "receptions", "targets",
             "rushing_tds", "receiving_tds", "target_share",
         ])
+        history_games = len(hist["carries"])
 
         def_player_id = def_player_by_team.get(team_id)
         team_carries_by_game = _get_stats_by_game_id(client, def_player_id, game_ids, "carries")
@@ -230,6 +238,7 @@ def compute_player_projection(
             "target_share", "targets", "receptions", "receiving_yards",
             "receiving_tds", "receiving_air_yards",
         ])
+        history_games = len(hist["targets"])
         adot_history = [
             (hist["receiving_air_yards"][i] / hist["targets"][i]) if hist["targets"][i] else 0.0
             for i in range(len(hist["targets"]))
@@ -246,6 +255,7 @@ def compute_player_projection(
 
     elif position == "K":
         hist, _ = _get_stat_history(client, player["player_id"], ["fg_att", "fg_made", "pat_att"])
+        history_games = len(hist["fg_att"])
         implied = team_implied_total(game, team_id)
         features = build_kicker_features(
             hist["fg_att"], hist["fg_made"], hist["pat_att"],
@@ -261,6 +271,7 @@ def compute_player_projection(
             "def_fumbles_forced", "def_tds", "special_teams_tds", "def_safeties",
             "fumble_recovery_tds",
         ])
+        history_games = len(own_hist["def_sacks"])
         own_takeaways_history = [
             own_hist["def_interceptions"][i] + own_hist["fumble_recovery_opp"][i]
             for i in range(len(own_hist["def_interceptions"]))
@@ -299,6 +310,13 @@ def compute_player_projection(
     else:
         return None
 
+    features = {
+        **features,
+        "vegas_available": vegas_available,
+        "low_sample": history_games < MIN_HISTORY_GAMES_FULL_SAMPLE,
+        "no_historical_data": history_games == 0,
+    }
+
     return {"points": points, "features": features, "game_id": game["game_id"]}
 
 
@@ -306,16 +324,34 @@ def compute_and_write_edge_scores(
     period: str = "week1",
     season: int | None = None,
     week: int | None = None,
+    positions: tuple[str, ...] | None = None,
 ) -> None:
     """
     `period` is a display label only (written to edge_scores.period) — it does
     NOT control which games get selected. Pass `season`/`week` together to
     target a specific historical week (backtest/historical use); leave both
     None to project each player's next real upcoming game (live use, default).
+
+    `positions`, when set, limits which player rows are scored (e.g.
+    OFFENSE_POSITIONS to exclude K/DST).
     """
+    if (season is None) ^ (week is None):
+        raise ValueError("season and week must both be set or both be None")
+
     client = get_supabase_client()
 
-    players_result = client.table("players").select("*").eq("sport", "nfl").execute()
+    if season is not None and week is not None:
+        print(
+            f"Game lookup: _get_game_for_period(season={season}, week={week}) "
+            f"[NOT _get_upcoming_game]"
+        )
+    else:
+        print("Game lookup: _get_upcoming_game() [live path]")
+
+    players_query = client.table("players").select("*").eq("sport", "nfl")
+    if positions:
+        players_query = players_query.in_("position", list(positions))
+    players_result = players_query.execute()
     players = players_result.data or []
 
     def_player_by_team = _get_def_player_by_team(client)
@@ -358,4 +394,9 @@ def compute_and_write_edge_scores(
 
 
 if __name__ == "__main__":
-    compute_and_write_edge_scores()
+    compute_and_write_edge_scores(
+        period="2025-WK12",
+        season=2025,
+        week=12,
+        positions=OFFENSE_POSITIONS,
+    )
