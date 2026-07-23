@@ -41,7 +41,7 @@ from scoring.season_stats import (
     aggregate_skill_season_totals,
     build_position_role_baselines,
     collect_raw_observed_stats,
-    compute_qb_rush_td_per_game_prior,
+    compute_qb_rush_td_per_carry_prior,
     fetch_player_season_games,
     fetch_season_games_by_player,
     fetch_team_season_totals,
@@ -355,7 +355,7 @@ def _build_role_baselines(
             observed_samples.append((position, player.get("depth_chart_rank"), raw))
 
     baselines = build_position_role_baselines(observed_samples)
-    baselines[("QB", None, "rush_tds_per_game_prior")] = compute_qb_rush_td_per_game_prior(
+    baselines[("QB", None, "rush_tds_per_carry_prior")] = compute_qb_rush_td_per_carry_prior(
         observed_samples,
     )
     return baselines

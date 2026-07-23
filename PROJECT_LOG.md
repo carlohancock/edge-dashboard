@@ -430,6 +430,26 @@ All five correctly flagged — not silently mis-projected as if still on their 2
 
 ---
 
+## Phase 5.1 — QB Draft Edge calibration + ADP-anchored Draft Priority Score (DPS) prototype
+
+**Pass-TD shrinkage k=300 VALIDATED, not changed.** Odd/even 2025 week split (n=33) found k=300 at the RMSE minimum (3.152) beating the league-mean baseline (3.405). Three chronological splits (early/late, reversed, and two cutoff variants, n=22-24) disagreed and favored k=400 or the baseline; those splits confound TD rate with season-trend effects. Honest status: the data supports k in the 300-400 range and is NOT sharply identified; k=300 retained. A proposal to LOWER k to 150 was tested and refuted by every split.
+
+**Rush-TD shrinkage CHANGED, empirically fitted.** Odd/even split (n=37) tested per-game vs per-carry denominators across a k grid. Per-carry k=50 with median prior won (RMSE 0.957) vs the prior hand-set per-game k=15 / p25 prior (1.226). All configs beat the population-mean baseline — rush-TD rate IS predictive (Spearman 0.59-0.69), unlike pass-TD rate. k=50-100 plateau is flat (~0.7% RMSE spread): identifiable but not sharply determined. The p25 prior (chosen to anchor pocket passers near zero) empirically underperformed the median and was replaced.
+
+**Effect:** every QB gained projected rush TDs, weighted toward real rushers (Allen 7.23 → 8.83, Hurts 4.13 → 5.53, Dart 4.97 → 6.56, Lamar 1.14 → 2.43).
+
+**DPS prototype (read-only, NOT in production).** New design direction: ADP is the market price, the model only adjusts where consensus is plausibly blind. DPS = ADP - (lambda_pos × Delta), Delta = 0.44×Z_xTD + 0.56×Z_Role. VORP/scarcity deliberately EXCLUDED as a Delta term — ADP already prices positional scarcity, so including it double-counts. Scope: only players with both an ADP row and 2025 stats (768 of 991 excluded — undrafted in a 12-team league, correctly out of scope for a draft tool). ADP source: FFC 12-team PPR, fetched 2026-07-21.
+
+**lambda_QB = 8.0** from a 4/8/12 sweep; note the structural finding that QB ADP gaps are too wide for Delta to reorder the board at any reasonable lambda.
+
+**STILL OPEN (do not mark resolved):**
+1. QB pass-attempt inflation. Lamar projects 415.8 attempts vs 302 actual (ratio 1.377) because `season_regressed_stat`'s distance-penalty term shrinks archetypally-low-volume passers toward the QB baseline, treating "run-first QB" as if it were small-sample noise. This is why DE# ranks him QB15. Affects projected_points, not DPS.
+2. `proj_games` flat 16 for every QB1 (depth-chart derived, ignores 2025 availability). Same root limitation as the parked Murray low-sample note.
+3. All DPS weights (0.44/0.56) and lambdas remain hand-set, flagged for empirical fit.
+4. RB/WR/TE/K Draft Edge not yet reviewed.
+
+---
+
 ## STILL AHEAD (Phase 4 remaining, then onward — order matters)
 
 1. **Wire scoring engine to per-game team columns.** Switch `compute_edge_scores.py` (rush_share resolution + any team-relative lookup, AND the season/week backtest path added in 4.9) to read `player_game_stats.team_id` / `opponent_team_id` instead of `players.team_id`. Needed for a fully correct backtest — otherwise compute-time team resolution re-introduces the bug the 4.8 data fix removed, for any traded player.

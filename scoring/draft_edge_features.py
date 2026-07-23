@@ -107,8 +107,8 @@ QB_FACTOR_AUDIT_KEYS = (
     "season_2025_ypa",
     "regressed_td_rate",
     "regressed_int_rate",
-    "regressed_rush_tds_per_game",
-    "qb_rush_td_per_game_prior",
+    "regressed_rush_td_per_carry",
+    "qb_rush_td_per_carry_prior",
     "proj_games_2026",
     "depth_chart_rank",
     "context_changed",
@@ -235,20 +235,20 @@ def build_draft_qb_features(
 
     td_rate = season_regressed_rate(pass_tds, attempts, LEAGUE_MEAN_PASS_TD_RATE, "qb_pass_td")
     int_rate = season_regressed_rate(pass_ints, attempts, LEAGUE_MEAN_INT_RATE, "qb_int")
-    rush_td_per_game_prior = (
-        _lookup_baseline(baselines, "QB", None, "rush_tds_per_game_prior", 0.0)
+    rush_td_per_carry_prior = (
+        _lookup_baseline(baselines, "QB", None, "rush_tds_per_carry_prior", 0.0)
         if baselines
         else 0.0
     )
-    rush_tds_per_game = season_regressed_rate(
-        rush_tds, games_played, rush_td_per_game_prior, "qb_rush_td_per_game",
+    rush_td_per_carry = season_regressed_rate(
+        rush_tds, rush_attempts, rush_td_per_carry_prior, "qb_rush_td",
     )
 
     proj_pass_yards = proj_pass_attempts * ypa
     proj_pass_tds = proj_pass_attempts * td_rate
     proj_pass_ints = proj_pass_attempts * int_rate
     proj_rush_yards = proj_rush_attempts * ypc
-    proj_rush_tds = rush_tds_per_game * proj_games
+    proj_rush_tds = proj_rush_attempts * rush_td_per_carry
 
     low_sample = games_played < MIN_SEASON_GAMES or attempts < MIN_SEASON_SAMPLE["pass_attempts"]
 
@@ -265,8 +265,8 @@ def build_draft_qb_features(
         "season_2025_ypa": ypa,
         "regressed_td_rate": td_rate,
         "regressed_int_rate": int_rate,
-        "regressed_rush_tds_per_game": rush_tds_per_game,
-        "qb_rush_td_per_game_prior": rush_td_per_game_prior,
+        "regressed_rush_td_per_carry": rush_td_per_carry,
+        "qb_rush_td_per_carry_prior": rush_td_per_carry_prior,
         "proj_games_2026": proj_games,
         "depth_chart_rank": depth_chart_rank,
         "context_changed": context_changed,
