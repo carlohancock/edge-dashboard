@@ -72,7 +72,15 @@ SEASON_TD_RATE_K = {
     "qb_rush_td": 50,  # Empirically selected via odd/even 2025 split (n=37, per-carry denominator, median prior); k=50-100 plateau is FLAT (~0.7% RMSE spread) so k is identifiable but NOT sharply determined; revisit with 2025→2026 outcome pairs.
     "qb_int": 300,        # weekly INT_RATE_K = 150
     "rb_rush_td": 200,    # weekly RUSH_TD_RATE_K = 100
-    "rb_rec_td": 120,     # weekly REC_TD_RATE_K = 60
+    # RB receiving-TD rate tested via odd/even 2025 split (n=52 RBs, >= 8 targets in
+    # both halves) across k in [0,15,30,60,90,120,180,250]. With the league-mean prior,
+    # RMSE improved monotonically toward k=250 and STILL lost to the prior*opportunities
+    # baseline (1.062 vs 1.043); Spearman was weak (0.31-0.41). The sample-median prior
+    # collapsed to 0.000 because over half the sample scored zero receiving TDs in odd
+    # weeks. Conclusion: RB receiving-TD rate carries essentially no predictive signal —
+    # k raised to 250 to shrink the player's own noisy rate to near-zero influence rather
+    # than pretending k=120 is meaningful. Flagged: this term is unidentified, not fitted.
+    "rb_rec_td": 250,
     "wr_te_rec_td": 120,  # weekly REC_TD_RATE_K = 60
 }
 

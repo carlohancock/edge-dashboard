@@ -23,18 +23,17 @@ from scoring.compute_draft_edge import (
 )
 from scoring.draft_edge_features import (
     DEFAULT_QB_GAMES_ESTIMATE,
-    DEFAULT_RB_RUSH_SHARE_PRIOR,
     DEFAULT_TE_TARGET_SHARE_PRIOR,
     DEFAULT_WR_TARGET_SHARE_PRIOR,
     DEFAULT_TEAM_PASS_ATTEMPTS_SEASON,
     DEFAULT_TEAM_RUSH_ATTEMPTS_SEASON,
     QB_GAMES_ESTIMATE_PRIOR,
-    RB_RUSH_SHARE_PRIOR,
     TE_TARGET_SHARE_PRIOR,
     WR_TARGET_SHARE_PRIOR,
     _depth_chart_tier,
     _team_season_attempts,
 )
+from scoring.points_calculator import calculate_rb_points
 from scoring.season_stats import (
     LEAGUE_MEAN_PASS_TD_RATE,
     LEAGUE_MEAN_RB_REC_TD_RATE,
@@ -55,9 +54,30 @@ DELTA_ROLE_WEIGHT = 0.56
 # Delta cannot meaningfully reorder the board at any reasonable lambda; 8.0 captures
 # the consistent movers (Daniels, Murray, Darnold) without the top-end churn seen at
 # 12.0. Flagged for empirical fit alongside the other lambdas.
-LAMBDA_POS = {"QB": 8.0, "RB": 5.0, "WR": 8.0, "TE": 6.0}
+# lambda_RB selected from a 3.0/5.0/8.0/12.0 sweep: movement scales smoothly and the
+# same players move in the same direction at every lambda (stable signal, not churn).
+# 8.0 leaves the elite tier (Bijan/Gibbs/McCaffrey) intact while capturing meaningful
+# mid-round moves (Hampton +3, Henry -4, Taylor -3, Barkley +2). 12.0 was rejected
+# because it reorders the top 5, and the RB points curve is steepest there — a 3-spot
+# fade in round 1 costs far more than the same move at RB25. Flagged for empirical fit
+# alongside the other lambdas.
+LAMBDA_POS = {"QB": 8.0, "RB": 8.0, "WR": 8.0, "TE": 6.0}
 CONTEXT_CHANGED_MULTIPLIER = 0.85
 GAMES_NORMALIZER = 16.0
+# RB weighted-opportunity share priors by depth_chart_rank — derived from 2025
+# median RB WO share by depth_chart_rank (n=110 RBs, >= 4 games, RB-only
+# backfield denominator, W_TARGET=2.51). The prior hand-set table
+# {1: 0.65, 2: 0.35, 3: 0.15, 4: 0.05} summed to 1.20 vs an empirical median
+# sum of 1.031 — that ~17% surplus systematically inflated Role Shift positive
+# for nearly every RB. Known limitations: (a) shares are grouped by CURRENT
+# (2026) depth_chart_rank against 2025 usage, since no 2025 depth-chart snapshot
+# exists — promoted/demoted players contaminate their bucket, likely biasing the
+# rank-1 median slightly low; (b) within-rank dispersion is wide (rank 1:
+# p10=0.32, p90=0.77), so a single median is a coarse prior. Flagged for revisit.
+RB_WO_SHARE_PRIOR = {1: 0.603, 2: 0.292, 3: 0.09, 4: 0.046}
+DEFAULT_RB_WO_SHARE_PRIOR = 0.046
+MIN_RB_CARRIES_W_TARGET = 50
+W_TARGET_COMPARISON = 1.5
 
 DPS_POSITIONS = ("QB", "RB", "WR", "TE")
 PAGE_SIZE = 1000
@@ -130,6 +150,90 @@ def _context_multiplier(context_changed: bool) -> float:
     return CONTEXT_CHANGED_MULTIPLIER if context_changed else 1.0
 
 
+def _build_team_targets_by_team(context) -> dict[str, float]:
+    """Season-normalized team targets from each team's DEF row."""
+    by_team: dict[str, float] = {}
+    for player in context.players:
+        if player.get("position") != "DEF":
+            continue
+        team_id = player["team_id"]
+        rows = context.season_games_by_player.get(player["player_id"], [])
+        totals = aggregate_skill_season_totals(rows)
+        by_team[team_id] = _team_season_attempts(
+            {"targets": totals["targets"], "games_played": totals["games_played"]},
+            "targets",
+            DEFAULT_TEAM_PASS_ATTEMPTS_SEASON,
+        )
+    return by_team
+
+
+def _team_rb_wo_denominator(
+    share_team_totals: dict,
+    team_id: str | None,
+    team_targets_by_team: dict[str, float],
+    w_target: float,
+) -> float:
+    team_carries = _team_season_attempts(
+        share_team_totals, "carries", DEFAULT_TEAM_RUSH_ATTEMPTS_SEASON,
+    )
+    team_targets = team_targets_by_team.get(team_id or "", 0.0)
+    if not team_targets:
+        team_targets = _team_season_attempts(
+            share_team_totals, "targets", DEFAULT_TEAM_PASS_ATTEMPTS_SEASON,
+        )
+    return team_carries + w_target * team_targets
+
+
+def _player_rb_wo(season_totals: dict, w_target: float) -> float:
+    return season_totals["carries"] + w_target * season_totals["targets"]
+
+
+def _derive_w_target(context) -> tuple[float, float, float, int]:
+    """
+    W_TARGET = (points per target) / (points per carry) across RBs with
+    >= MIN_RB_CARRIES_W_TARGET carries in 2025, under league scoring rules.
+    """
+    total_carries = 0.0
+    total_targets = 0.0
+    total_rush_pts = 0.0
+    total_rec_pts = 0.0
+    rb_count = 0
+
+    for player in context.players:
+        if player["position"] != "RB":
+            continue
+        rows = context.season_games_by_player.get(player["player_id"], [])
+        totals = aggregate_skill_season_totals(rows)
+        if totals["games_played"] == 0 or totals["carries"] < MIN_RB_CARRIES_W_TARGET:
+            continue
+
+        rush_pts = calculate_rb_points({
+            "proj_rush_yards": totals["rushing_yards"],
+            "proj_rush_tds": totals["rushing_tds"],
+            "proj_rec_yards": 0.0,
+            "proj_receptions": 0.0,
+            "proj_rec_tds": 0.0,
+        })
+        rec_pts = calculate_rb_points({
+            "proj_rush_yards": 0.0,
+            "proj_rush_tds": 0.0,
+            "proj_rec_yards": totals["receiving_yards"],
+            "proj_receptions": totals["receptions"],
+            "proj_rec_tds": totals["receiving_tds"],
+        })
+
+        total_carries += totals["carries"]
+        total_targets += totals["targets"]
+        total_rush_pts += rush_pts
+        total_rec_pts += rec_pts
+        rb_count += 1
+
+    points_per_carry = total_rush_pts / total_carries if total_carries else 0.0
+    points_per_target = total_rec_pts / total_targets if total_targets else 0.0
+    w_target = points_per_target / points_per_carry if points_per_carry else 0.0
+    return points_per_carry, points_per_target, w_target, rb_count
+
+
 def _low_sample(position: str, season_totals: dict) -> bool:
     gp = season_totals["games_played"]
     if gp < MIN_SEASON_GAMES:
@@ -187,23 +291,28 @@ def _compute_role_shift(
     season_totals: dict,
     share_team_totals: dict,
     context_changed: bool,
+    *,
+    w_target: float = 1.0,
+    team_targets_by_team: dict[str, float] | None = None,
+    primary_2025_team: str | None = None,
 ) -> float:
     position = player["position"]
     depth_chart_rank = player.get("depth_chart_rank")
     gp = season_totals["games_played"]
     mult = _context_multiplier(context_changed)
+    team_targets_by_team = team_targets_by_team or {}
 
     if position == "QB":
         proj_games = _depth_chart_tier(depth_chart_rank, QB_GAMES_ESTIMATE_PRIOR, DEFAULT_QB_GAMES_ESTIMATE)
         return ((proj_games - gp) / GAMES_NORMALIZER) * mult
 
     if position == "RB":
-        # v1: rush_share only (not blended touch share)
-        share_team_carries = _team_season_attempts(
-            share_team_totals, "carries", DEFAULT_TEAM_RUSH_ATTEMPTS_SEASON,
+        team_wo = _team_rb_wo_denominator(
+            share_team_totals, primary_2025_team, team_targets_by_team, w_target,
         )
-        observed = (season_totals["carries"] / share_team_carries) if share_team_carries else 0.0
-        expected = _depth_chart_tier(depth_chart_rank, RB_RUSH_SHARE_PRIOR, DEFAULT_RB_RUSH_SHARE_PRIOR)
+        player_wo = _player_rb_wo(season_totals, w_target)
+        observed = (player_wo / team_wo) if team_wo else 0.0
+        expected = _depth_chart_tier(depth_chart_rank, RB_WO_SHARE_PRIOR, DEFAULT_RB_WO_SHARE_PRIOR)
         return (expected - observed) * mult
 
     if position == "WR":
@@ -225,8 +334,14 @@ def _compute_role_shift(
     return 0.0
 
 
-def _build_player_records(context) -> tuple[list[dict], int]:
+def _build_player_records(
+    context,
+    *,
+    w_target: float,
+    team_targets_by_team: dict[str, float],
+) -> tuple[list[dict], int, dict[str, int]]:
     excluded_no_adp = 0
+    no_data_counts: dict[str, int] = {p: 0 for p in DPS_POSITIONS}
     records: list[dict] = []
 
     for player in context.players:
@@ -243,6 +358,18 @@ def _build_player_records(context) -> tuple[list[dict], int]:
         rows = context.season_games_by_player.get(pid, [])
         season_totals = aggregate_skill_season_totals(rows)
         if season_totals["games_played"] == 0:
+            no_data_counts[position] += 1
+            records.append({
+                "player_id": pid,
+                "name": player["full_name"],
+                "position": position,
+                "adp": adp,
+                "xtd_raw": 0.0,
+                "role_raw": 0.0,
+                "context_changed": False,
+                "low_sample": False,
+                "no_2025_data": True,
+            })
             continue
 
         primary_2025_team = primary_team_id(season_totals["team_ids_seen"])
@@ -251,7 +378,15 @@ def _build_player_records(context) -> tuple[list[dict], int]:
         share_team_totals = context.team_totals_by_team.get(primary_2025_team, {})
 
         xtd_raw = _compute_xtd_delta(position, season_totals, context.baselines)
-        role_raw = _compute_role_shift(player, season_totals, share_team_totals, context_changed)
+        role_raw = _compute_role_shift(
+            player,
+            season_totals,
+            share_team_totals,
+            context_changed,
+            w_target=w_target,
+            team_targets_by_team=team_targets_by_team,
+            primary_2025_team=primary_2025_team,
+        )
 
         records.append({
             "player_id": pid,
@@ -262,13 +397,38 @@ def _build_player_records(context) -> tuple[list[dict], int]:
             "role_raw": role_raw,
             "context_changed": context_changed,
             "low_sample": _low_sample(position, season_totals),
+            "no_2025_data": False,
+            "_player": player,
+            "_season_totals": season_totals,
+            "_share_team_totals": share_team_totals,
+            "_primary_2025_team": primary_2025_team,
         })
 
-    return records, excluded_no_adp
+    return records, excluded_no_adp, no_data_counts
+
+
+def _recompute_rb_role_shifts(
+    records: list[dict],
+    *,
+    w_target: float,
+    team_targets_by_team: dict[str, float],
+) -> None:
+    for rec in records:
+        if rec["position"] != "RB" or rec.get("no_2025_data"):
+            continue
+        rec["role_raw"] = _compute_role_shift(
+            rec["_player"],
+            rec["_season_totals"],
+            rec["_share_team_totals"],
+            rec["context_changed"],
+            w_target=w_target,
+            team_targets_by_team=team_targets_by_team,
+            primary_2025_team=rec["_primary_2025_team"],
+        )
 
 
 def _apply_z_scores_and_dps(records: list[dict]) -> dict[str, int]:
-    """Z-score xTD/Role within position; compute DPS. Returns n per position."""
+    """Z-score xTD/Role within position (2025-data players only); compute DPS."""
     by_pos: dict[str, list[dict]] = {p: [] for p in DPS_POSITIONS}
     for rec in records:
         by_pos[rec["position"]].append(rec)
@@ -276,30 +436,37 @@ def _apply_z_scores_and_dps(records: list[dict]) -> dict[str, int]:
     sample_sizes: dict[str, int] = {}
     for position in DPS_POSITIONS:
         group = by_pos[position]
-        sample_sizes[position] = len(group)
-        if not group:
-            continue
+        with_data = [r for r in group if not r.get("no_2025_data")]
+        no_data = [r for r in group if r.get("no_2025_data")]
+        sample_sizes[position] = len(with_data)
 
-        xtd_vals = [r["xtd_raw"] for r in group]
-        role_vals = [r["role_raw"] for r in group]
+        if with_data:
+            xtd_vals = [r["xtd_raw"] for r in with_data]
+            role_vals = [r["role_raw"] for r in with_data]
 
-        xtd_sigma = statistics.pstdev(xtd_vals) if len(xtd_vals) > 1 else 0.0
-        role_sigma = statistics.pstdev(role_vals) if len(role_vals) > 1 else 0.0
-        if xtd_sigma == 0:
-            print(f"  WARNING: {position} xTD_Delta sigma == 0 — Z_xTD set to 0 for all")
-        if role_sigma == 0:
-            print(f"  WARNING: {position} Role_Shift sigma == 0 — Z_Role set to 0 for all")
+            xtd_sigma = statistics.pstdev(xtd_vals) if len(xtd_vals) > 1 else 0.0
+            role_sigma = statistics.pstdev(role_vals) if len(role_vals) > 1 else 0.0
+            if xtd_sigma == 0:
+                print(f"  WARNING: {position} xTD_Delta sigma == 0 — Z_xTD set to 0 for all")
+            if role_sigma == 0:
+                print(f"  WARNING: {position} Role_Shift sigma == 0 — Z_Role set to 0 for all")
 
-        z_xtd = _z_scores(xtd_vals)
-        z_role = _z_scores(role_vals)
-        lam = LAMBDA_POS[position]
+            z_xtd = _z_scores(xtd_vals)
+            z_role = _z_scores(role_vals)
+            lam = LAMBDA_POS[position]
 
-        for rec, zx, zr in zip(group, z_xtd, z_role):
-            delta = DELTA_XTD_WEIGHT * zx + DELTA_ROLE_WEIGHT * zr
-            rec["z_xtd"] = zx
-            rec["z_role"] = zr
-            rec["delta"] = delta
-            rec["dps"] = rec["adp"] - lam * delta
+            for rec, zx, zr in zip(with_data, z_xtd, z_role):
+                delta = DELTA_XTD_WEIGHT * zx + DELTA_ROLE_WEIGHT * zr
+                rec["z_xtd"] = zx
+                rec["z_role"] = zr
+                rec["delta"] = delta
+                rec["dps"] = rec["adp"] - lam * delta
+
+        for rec in no_data:
+            rec["z_xtd"] = 0.0
+            rec["z_role"] = 0.0
+            rec["delta"] = 0.0
+            rec["dps"] = rec["adp"]
 
     return sample_sizes
 
@@ -329,11 +496,62 @@ def _rank_by_dps(records: list[dict]) -> None:
 
 def _flags_str(rec: dict) -> str:
     flags = []
+    if rec.get("no_2025_data"):
+        flags.append("no_2025_data")
     if rec["context_changed"]:
         flags.append("context_changed")
     if rec["low_sample"]:
         flags.append("low_sample")
     return ",".join(flags) if flags else "-"
+
+
+def _print_board_table(
+    records: list[dict],
+    position: str,
+    draft_edge_ranks: dict[str, int],
+    *,
+    title: str,
+    top_n: int = 30,
+) -> None:
+    group = [r for r in records if r["position"] == position]
+    group.sort(key=lambda r: r["dps_rank"])
+
+    header = (
+        f"{'DPS#':>4} | {'Player':<26} | {'ADP#':>4} | {'DE#':>4} | {'ADP':>6} | "
+        f"{'DPS':>7} | {'Delta':>6} | {'Z_xTD':>6} | {'Z_Role':>6} | {'Move':>5} | Flags"
+    )
+    print(f"\n{'=' * len(header)}")
+    print(title)
+    print(header)
+    print("-" * len(header))
+
+    for rec in group[:top_n]:
+        de_rank = draft_edge_ranks.get(rec["player_id"])
+        de_str = str(de_rank) if de_rank is not None else "-"
+        print(
+            f"{rec['dps_rank']:>4} | {rec['name']:<26} | {rec['adp_rank']:>4} | {de_str:>4} | "
+            f"{rec['adp']:>6.1f} | {rec['dps']:>7.2f} | {rec['delta']:>6.3f} | "
+            f"{rec['z_xtd']:>6.2f} | {rec['z_role']:>6.2f} | {rec['rank_move']:>+5} | "
+            f"{_flags_str(rec)}"
+        )
+
+
+def _print_no_2025_data_summary(records: list[dict], no_data_counts: dict[str, int]) -> None:
+    print("\nno_2025_data players added (Delta=0, DPS=ADP, excluded from z-score sample):")
+    for position in DPS_POSITIONS:
+        print(f"  {position}: {no_data_counts.get(position, 0)}")
+
+    no_data = [r for r in records if r.get("no_2025_data")]
+    top5 = sorted(no_data, key=lambda r: r["adp"])[:5]
+    print("\nTop 5 no_2025_data players by ADP (where they land on DPS board):")
+    if not top5:
+        print("  (none)")
+        return
+    for rec in top5:
+        print(
+            f"  {rec['name']:<26} ADP={rec['adp']:>6.1f}  ADP#{rec['adp_rank']:>3}  "
+            f"DPS#{rec['dps_rank']:>3}  move={rec['rank_move']:>+3}"
+        )
 
 
 def _print_position_board(
@@ -437,9 +655,22 @@ def main() -> None:
 
     client = get_supabase_client()
     context = load_draft_edge_context(client)
+    team_targets_by_team = _build_team_targets_by_team(context)
 
-    records, excluded_no_adp = _build_player_records(context)
-    print(f"Excluded (draft pool, no ADP): {excluded_no_adp}")
+    ppc, ppt, w_target_derived, w_target_rb_n = _derive_w_target(context)
+    print("RB W_TARGET derivation (>= 50 carries in 2025, full PPR scoring rules)")
+    print("-" * 60)
+    print(f"  RBs in sample:     {w_target_rb_n}")
+    print(f"  points/carry:      {ppc:.4f}")
+    print(f"  points/target:     {ppt:.4f}")
+    print(f"  W_TARGET (derived): {w_target_derived:.4f}")
+
+    records, excluded_no_adp, no_data_counts = _build_player_records(
+        context,
+        w_target=w_target_derived,
+        team_targets_by_team=team_targets_by_team,
+    )
+    print(f"\nExcluded (draft pool, no ADP): {excluded_no_adp}")
 
     draft_edge_ranks = _fetch_draft_edge_ranks(client)
 
@@ -448,10 +679,38 @@ def main() -> None:
     _rank_by_dps(records)
 
     positions = positions_filter or DPS_POSITIONS
+
+    if "RB" in positions:
+        _print_board_table(
+            records,
+            "RB",
+            draft_edge_ranks,
+            title=f"RB — top 30 by DPS (W_TARGET={w_target_derived:.4f}, lower DPS = draft earlier)",
+        )
+        _print_no_2025_data_summary(records, no_data_counts)
+
+        _recompute_rb_role_shifts(
+            records, w_target=W_TARGET_COMPARISON, team_targets_by_team=team_targets_by_team,
+        )
+        _apply_z_scores_and_dps(records)
+        _rank_by_dps(records)
+        _print_board_table(
+            records,
+            "RB",
+            draft_edge_ranks,
+            title=f"RB — top 30 by DPS (W_TARGET={W_TARGET_COMPARISON} comparison, lower DPS = draft earlier)",
+        )
+        print(f"\nRB z-score sample (2025-data only): n={sample_sizes.get('RB', 0)}")
+
     for position in positions:
+        if position == "RB":
+            continue
         _print_position_board(
             records, position, draft_edge_ranks, sample_sizes.get(position, 0),
         )
+
+    if "RB" not in positions:
+        _print_no_2025_data_summary(records, no_data_counts)
 
 
 if __name__ == "__main__":

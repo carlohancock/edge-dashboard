@@ -442,11 +442,23 @@ All five correctly flagged — not silently mis-projected as if still on their 2
 
 **lambda_QB = 8.0** from a 4/8/12 sweep; note the structural finding that QB ADP gaps are too wide for Delta to reorder the board at any reasonable lambda.
 
+### RB — Draft Edge calibration + DPS (read-only prototype)
+
+- **Weighted Opportunities replaces rush-share-only Role Shift.** RB Role Shift previously used rush share alone, ignoring receiving work entirely (a v1 simplification flagged in code). Now uses WO = carries + (W_TARGET * targets).
+- **W_TARGET = 2.51, DERIVED not assumed.** Computed from 2025 RB data under the league's actual full-PPR rules (n=63, >=50 carries): points/carry 0.6547, points/target 1.6438. The commonly-cited 1.5 comes from half-PPR/standard scoring and is wrong for this league — in full PPR the reception point alone exceeds the value of an average carry.
+- **RB WO share priors DERIVED from 2025 data**: {1: 0.603, 2: 0.292, 3: 0.09, 4: 0.046} (medians, n=110 RBs, >=4 games, RB-only backfield denominator). The prior hand-set table {0.65/0.35/0.15/0.05} summed to 1.20 vs an empirical median sum of 1.031 — a ~17% surplus that systematically inflated Role Shift positive. Known limitations: shares grouped by CURRENT 2026 depth_chart_rank against 2025 usage (no 2025 snapshot exists), and within-rank dispersion is wide (rank 1: p10=0.32, p90=0.77).
+- **RB rush-TD k=200 VALIDATED, unchanged.** Odd/even split (n=64, >=20 carries both halves) found a broad plateau k=150-400 (RMSE within ~1%), all beating baseline. Not sharply identified but defensible.
+- **RB receiving-TD k RAISED 120 -> 250, term declared unidentified.** Odd/even split (n=52) found RMSE improving monotonically toward k=250 while STILL losing to the prior*opportunities baseline (1.062 vs 1.043), Spearman only 0.31-0.41. Sample-median prior collapsed to 0.000 (over half the sample had zero odd-week receiving TDs). RB receiving-TD rate carries essentially no predictive signal; k raised to shrink the player's own noisy rate to near-zero influence.
+- **Rookies / no-2025-data players now included** at Delta=0, DPS=ADP, flagged `no_2025_data`, excluded from z-score sampling. Honest handling: we have no model edge on players who haven't taken an NFL snap, so we defer fully to market. (Counts added: QB 1, RB 3, WR 12, TE 1.)
+- **lambda_RB = 8.0** from a 3/5/8/12 sweep (rationale in `draft_priority_review.py` LAMBDA_POS comment).
+- **Structural finding worth remembering:** because Delta is z-scored within position, any UNIFORM shift to a raw signal is normalized away — only changes that reorder players RELATIVE to each other move the board. The WO switch moved things; the prior-sum correction produced exactly one sign flip across 50 RBs despite fixing a real 17% bias.
+- **STILL OPEN (RB):** backfield composition is inferred from depth_chart_rank, not measured — vacated/arriving touches are invisible unless the depth chart moved. Deferred as a multi-team tracking dependency.
+
 **STILL OPEN (do not mark resolved):**
 1. QB pass-attempt inflation. Lamar projects 415.8 attempts vs 302 actual (ratio 1.377) because `season_regressed_stat`'s distance-penalty term shrinks archetypally-low-volume passers toward the QB baseline, treating "run-first QB" as if it were small-sample noise. This is why DE# ranks him QB15. Affects projected_points, not DPS.
 2. `proj_games` flat 16 for every QB1 (depth-chart derived, ignores 2025 availability). Same root limitation as the parked Murray low-sample note.
 3. All DPS weights (0.44/0.56) and lambdas remain hand-set, flagged for empirical fit.
-4. RB/WR/TE/K Draft Edge not yet reviewed.
+4. WR/TE/K Draft Edge not yet reviewed (RB reviewed — see ### RB above).
 
 ---
 
