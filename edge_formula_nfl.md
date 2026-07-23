@@ -10,6 +10,8 @@ Projected Points → Edge (percentile rank, this week)
                  → Wire Edge (short-horizon projection, next 2-3 weeks)
 ```
 
+> **Draft Edge (season-long):** QB and RB Draft Edge are now specified in **[docs/edge_formula_draft_edge.md](docs/edge_formula_draft_edge.md)** — the **Draft Priority Score (DPS)** architecture (ADP baseline + xTD/Role adjustments). This file (`edge_formula_nfl.md`) remains **authoritative for weekly Edge** and for the shared projected-points / shrinkage machinery. WR, TE, K, and DST Draft Edge still follow the projected-points path described here until migrated to the DPS spec.
+
 ---
 
 ## Vegas-derived features (computed once per game, used everywhere)
