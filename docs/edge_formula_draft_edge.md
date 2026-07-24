@@ -1,19 +1,19 @@
 # Draft Edge — Draft Priority Score (DPS) Specification
 
-**Status: IN PROGRESS**
+**Status: PRODUCTION — all six positions finalized, DPS written to `edge_scores`**
 
 | Position | DPS spec status | Production `edge_scores` write |
 |---|---|---|
-| QB | **Finalized and committed** | Not yet — DPS is read-only |
-| RB | **Finalized and committed** | Not yet — DPS is read-only |
-| WR | **Finalized and committed** | Legacy projected-points path |
-| TE | **Finalized — no adjustment (Δ = 0)** | Legacy projected-points path |
-| K | **Finalized — no adjustment (Δ = 0)** | Legacy projected-points path |
-| DST | **Finalized — no adjustment (Δ = 0)** | Legacy projected-points path |
+| QB | Finalized and committed | Live (`draft_edge`, `period='2026-draftedge'`) |
+| RB | Finalized and committed | Live |
+| WR | Finalized and committed | Live |
+| TE | Finalized — no adjustment (Δ = 0) | Live (`DPS = ADP`) |
+| K | Finalized — no adjustment (Δ = 0) | Live (`DPS = ADP`) |
+| DST | Finalized — no adjustment (Δ = 0) | Live (`DPS = ADP`) |
 
-**Implementation (read-only prototype):** `scoring/draft_priority_review.py` — computes and prints DPS boards; **does not write** to `edge_scores` or any table.
+**Implementation:** `scoring/compute_draft_edge.py` writes DPS to `edge_scores`. `scoring/draft_priority_review.py` remains the read-only review tool. Shared computation lives in `scoring/draft_priority_score.py` (imported by both paths, not duplicated); review output was verified identical after the refactor.
 
-**Legacy reference:** `edge_formula_nfl.md` and `scoring/compute_draft_edge.py` still describe the original **projected-points** Draft Edge ranking (season-long fantasy point totals from 2025 stats). That path remains live in code for WR/TE/K production writes and is still used for weekly Edge. It is **superseded for Draft Edge purposes** by this document for all six positions (TE/K/DST as `DPS = ADP`).
+**Weekly Edge (separate product):** The legacy **projected-points** season model in `edge_formula_nfl.md` is no longer the Draft Edge ranking for any position. It remains authoritative for **weekly Edge** scoring only.
 
 ---
 
@@ -32,7 +32,7 @@ Examples from the legacy path: Lamar Jackson ranked QB15, Matthew Stafford QB2.
 
 **Design pivot:** Market ADP (FFC 12-team full PPR) is the baseline **price**. The model only adjusts pick position where consensus is plausibly blind — specifically where 2025 counting stats and current depth-chart role imply mispricing of **touchdown luck (xTD)** and **role/opportunity (Role Shift)** relative to peers at the same position.
 
-Projected fantasy points remain useful for weekly Edge and for legacy Draft Edge production writes; they are **not** the Draft Edge rank for QB/RB/WR under this spec. TE under this spec is **pure ADP** (`Δ = 0`) — see Position spec: TE.
+Projected fantasy points remain useful for **weekly Edge** via `edge_formula_nfl.md`; they are **not** the Draft Edge rank under this spec. TE/K/DST under this spec are **pure ADP** (`Δ = 0`) — see Position specs below.
 
 ---
 
@@ -77,7 +77,7 @@ Players without 2025 data are **excluded from the μ/σ sample** and receive `De
 
 - Only players with an **ADP row** receive a DPS.
 - Source: **FFC 12-team full PPR** (`adp` table; latest `fetched_at` per `player_id`).
-- Players without ADP are undrafted in a 12-team league and are **correctly out of scope** for a draft board (~**774 of 991** draft-pool players excluded for missing ADP).
+- Players without ADP are undrafted in a 12-team, 15-roster-spot league (180 picks) and receive **no** `draft_edge` row — correctly out of scope (~**774 of 991** draft-pool players excluded for missing ADP).
 
 **2025 stats**
 
@@ -92,6 +92,32 @@ Players without 2025 data are **excluded from the μ/σ sample** and receive `De
 
 - `context_changed` — primary 2025 team ≠ current `players.team_id`; Role Shift multiplied by `context_multiplier`.
 - `low_sample` — 2025 volume below position thresholds (see `MIN_SEASON_GAMES`, `MIN_SEASON_SAMPLE` in `season_stats.py`).
+
+---
+
+## Production write
+
+**Population:** ADP-eligible players only — **n = 217** (QB 26 / RB 53 / WR 78 / TE 23 / K 16 / DST 21). Players without ADP get no `draft_edge` row.
+
+**Row count change:** ~**991** legacy projected-points rows → **217** DPS rows for `period='2026-draftedge'`. Stale legacy rows were explicitly deleted before upsert; delete count verified against pre-delete row count and post-delete residual check (same verification pattern as Phase 3 game seeding).
+
+**Schema:**
+
+- `score_type = 'draft_edge'`
+- `period = '2026-draftedge'`
+- `positional_rank` = DPS rank ascending within position (lower rank = draft earlier)
+- `score_value` = null (rank-based, not /100)
+
+**`factor_breakdown` contents:** `dps`, `adp`, `adp_positional_rank`, `delta`, `overall_rank`, position-appropriate z-components and raw components, `lambda_used`, and flags (`context_changed`, `low_sample`, `no_2025_data` where applicable).
+
+**Cross-position overall board:** DPS is denominated in pick-number space for every position, so the overall rank is a straight ascending sort by `dps` — no normalization, VORP, or scarcity adjustment. Stored as `overall_rank` in `factor_breakdown`.
+
+**Verification anchor (production run):**
+
+- Overall top 5: Bijan (RB, DPS −2.20), Nacua (WR, 4.79), Gibbs (RB, 5.71), Chase (WR, 5.76), McCaffrey (RB, 6.47)
+- WR anchor holds: Nacua WR#1, Chase WR#2, Lamb WR#3, JSN WR#6 (same as prototype at λ = 4)
+
+**Writer:** `compute_and_write_draft_edge()` in `scoring/compute_draft_edge.py`.
 
 ---
 
@@ -223,7 +249,7 @@ xTD_Delta = (WR_BETA_TGT × targets_2025)
 
 Positive `xTD_Delta` → scored **fewer** receiving TDs than the opportunity model expected (unlucky) → model bumps draft priority.
 
-The legacy WR/TE shrunk rec-TD path (`SEASON_TD_RATE_K["wr_te_rec_td"]`) remains in code for **TE only**; WR no longer calls it in `draft_priority_review.py`.
+The legacy WR/TE shrunk rec-TD path (`SEASON_TD_RATE_K["wr_te_rec_td"]`) remains in `season_stats.py` for other engines; the WR DPS path does not use it.
 
 ### Role Shift (shrunk per-game WOPR vs depth-rank median)
 
@@ -290,7 +316,7 @@ Z-scoring rules unchanged: population μ/σ within WR, 2025-data sample only; σ
 
 **2 / 3 / 4 / 5 / 6 / 8** sweep at Set C weights: WR ADP is denser than QB — same `Delta` moves more rank spots at higher lambda. **4.0** keeps the elite tier intact (only JSN / Lamb λ-sensitive); **8.0** over-promotes Lamb and distorts JSN. At λ = 4: mean |Move| ≈ 0.92, max |Move| = 5, n_move ≥ 5 = 1.
 
-Prototype board at λ = 4 (Set C): Nacua DPS#1, Chase #2, Lamb #3 (+3), JSN #6 (−3) — matches the sweep.
+Prototype board at λ = 4 (Set C): Nacua DPS#1, Chase #2, Lamb #3 (+3), JSN #6 (−3) — confirmed unchanged in production write.
 
 ---
 
@@ -460,28 +486,36 @@ DEF-row season totals (`player_game_stats` for each team's DEF player) provide t
 
 4. **Z-scoring normalizes away uniform shifts** — any change that moves all players' raw xTD or Role Shift by the same amount does **not** change `Delta` or DPS. Only **relative** reordering within the position moves the board. Example: fixing a 17% prior-sum bias on RB WO priors produced only one z-score sign flip across 50 RBs.
 
-5. **No 2026 market / Vegas features** — no odds or game-script data exists this far before the season; not in DPS v1.
+5. **No 2026 market / Vegas features** — no odds or game-script data exists this far before the season; not in DPS v1 (K revisit flagged once 2026 odds exist).
 
-6. **Legacy projected-points Draft Edge still runs for WR/TE/K production writes** — WR DPS and TE `Δ = 0` are committed in the read-only prototype / this spec, but `compute_draft_edge.py` has not switched; cross-position comparability with QB/RB/WR/TE DPS does not exist yet.
+6. **QB Role Shift uses flat 16 games for QB1** — ignores 2025 injury/availability history except via `games_played_2025`.
 
-7. **QB Role Shift uses flat 16 games for QB1** — ignores 2025 injury/availability history except via `games_played_2025`.
+7. **WR Availability rewards missed games unconditionally** — no distinction between fluke and chronic injury; no injury-history data. Any 2025 games missed increase Availability equally.
 
-8. **WR Availability rewards missed games unconditionally** — no distinction between fluke and chronic injury; no injury-history data. Any 2025 games missed increase Availability equally.
+8. **WR xTD cannot see offseason target competition** — a WR1's TD-luck rebound is projected without regard to a new arrival in the receiving corps (e.g. vacated or competing targets invisible to the opportunity model).
 
-9. **WR xTD cannot see offseason target competition** — a WR1's TD-luck rebound is projected without regard to a new arrival in the receiving corps (e.g. vacated or competing targets invisible to the opportunity model).
+9. **WR `proj_games` is flat 17 across depth ranks** — Availability is a pure games-missed count, not a depth-chart games expectation like QB.
 
-10. **WR `proj_games` is flat 17 across depth ranks** — Availability is a pure games-missed count, not a depth-chart games expectation like QB.
+10. **TE is anchored fully to market ADP** — any TE mispricing the market carries through unchanged (`Δ_TE = 0`). Revisit if red-zone or snap-alignment data becomes available.
 
-11. **TE is anchored fully to market ADP** — any TE mispricing the market carries through unchanged (`Δ_TE = 0`). Revisit if red-zone or snap-alignment data becomes available, or if the ADP-eligible TE pool grows materially.
+11. **DPS can go below 1.0 for elite players** — e.g. Bijan at −2.20 means the model wants them earlier than the first pick, which is unrepresentable in a real draft. A display-layer floor at 1.0 is appropriate; the stored value is left unclamped.
 
-12. **Three of six positions (TE, K, DST) are anchored fully to market ADP** — Draft Edge's model contribution is concentrated in QB, RB, and WR. Any mispricing at TE/K/DST carries through unchanged.
+12. **The overall board is RB-weighted at the top** — 7 of the first 15 overall are RBs. Partly genuine full-PPR RB scarcity, partly that RB carries both the largest λ among adjusted positions and the most active Δ.
+
+13. **Three of six positions (TE, K, DST) pass ADP through unchanged** — model contribution is concentrated in QB, RB, and WR.
+
+14. **FFC ADP is scoped to 12 teams** (`ADP_TEAMS` in `seed_adp.py`), which matches this league. Re-seed required if league size changes.
 
 ---
 
 ## Not yet done
 
-- [ ] Write DPS to `edge_scores` as production `draft_edge` ranking (`score_type='draft_edge'`, `positional_rank`)
-- [ ] Cross-position overall draft rank (single ordered board)
+- [ ] Empirical fit of QB/RB `Delta` weights (0.44/0.56) and `context_multiplier`
+- [ ] 2025→2026 outcome validation for lambdas and priors
+- [ ] Persisted 2025 depth-chart snapshot (or inferred role from usage alone)
+- [ ] TE revisit if red-zone / snap-alignment data becomes available
+- [ ] K revisit once 2026 odds exist (implied-team-total lever)
+- [ ] DST revisit if multi-season DEF data accumulates enough to test turnover-regression hypothesis
 
 ---
 
@@ -495,12 +529,14 @@ DEF-row season totals (`player_game_stats` for each team's DEF player) provide t
 | Team DEF-row totals | DEF `player_game_stats` rows (team box score) |
 | League scoring (W_TARGET derivation) | `config/league_scoring_rules.py` + `points_calculator.calculate_rb_points` |
 | Shrinkage k table | `season_stats.SEASON_TD_RATE_K` |
-| Read-only runner | `scoring/draft_priority_review.py` |
+| Shared DPS computation | `scoring/draft_priority_score.py` |
+| Production writer | `scoring/compute_draft_edge.py` → `edge_scores` |
+| Read-only review | `scoring/draft_priority_review.py` |
 
 ---
 
 ## Related documents
 
-- **Weekly Edge / shared projection math:** `edge_formula_nfl.md` (authoritative for weekly Edge; legacy projected-points production writes for WR/TE/K)
+- **Weekly Edge / shared projection math:** `edge_formula_nfl.md` (authoritative for weekly Edge only — not Draft Edge)
 - **Calibration log:** `PROJECT_LOG.md` Phase 5.1 (QB + RB + WR + TE; K/DST Δ = 0 in this spec)
-- **Legacy Draft Edge writer:** `scoring/compute_draft_edge.py` (projected points → `edge_scores`)
+- **Production Draft Edge writer:** `scoring/compute_draft_edge.py` (DPS → `edge_scores`)
