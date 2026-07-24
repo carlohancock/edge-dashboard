@@ -454,11 +454,75 @@ All five correctly flagged — not silently mis-projected as if still on their 2
 - **Structural finding worth remembering:** because Delta is z-scored within position, any UNIFORM shift to a raw signal is normalized away — only changes that reorder players RELATIVE to each other move the board. The WO switch moved things; the prior-sum correction produced exactly one sign flip across 50 RBs despite fixing a real 17% bias.
 - **STILL OPEN (RB):** backfield composition is inferred from depth_chart_rank, not measured — vacated/arriving touches are invisible unless the depth chart moved. Deferred as a multi-team tracking dependency.
 
+### WR — Draft Edge calibration + DPS (read-only prototype)
+
+**Framing.** WR was the first position to break the QB/RB Δ template. Two structural departures, both data-driven: a **pure-opportunity xTD** (no shrunken player TD rate) and a **three-term Δ** including a separate **Availability** component. Implementation: `scoring/draft_priority_review.py` (read-only; no `edge_scores` writes). Spec: `docs/edge_formula_draft_edge.md` § Position spec: WR.
+
+**Bugs found and fixed:**
+
+- **`actual_target_share` units mismatch.** Legacy Role Shift computed `actual_target_share` as targets ÷ team **pass attempts** while `WR_TARGET_SHARE_PRIOR` was expressed as a share of team **targets** (all positions) — prior and actual in different units. Corrected to targets ÷ team total targets. Team-level validation after correction: WR share 0.49–0.66, TE 0.21–0.29, RB 0.10–0.22 across sampled teams.
+- **Denominator fix did not move the board.** Z-scoring absorbs uniform shifts (known limitation #4 in the DPS spec doc). Recorded as a diagnostic result: the units bug was real but was **not** the cause of implausible rankings.
+- **Hand-set priors re-derived and rejected as a fix.** 2025 medians by depth rank came back at **0.2381 / 0.1703 / 0.1105 / 0.0705** vs hand-set **0.22 / 0.16 / 0.11 / 0.06** — close enough that the correction normalized away. Unlike RB (where hand-set priors summed ~17% high), the WR priors were nearly right. This isolated the problem to the **functional form**, not the constants.
+
+**Root cause — `prior − actual` is wrong for WR.** The form penalizes high usage. For RB it was defensible (workload regresses). For WR it meant the four best receivers in football (JSN, Chase, Jefferson, ARSB) all carried large **negative** Role Shift for being good. Diagnosis: season-total target/WOPR share **conflates role quality with games played** — Nabers read as a low-role WR1 (0.2065 season share) purely from playing 4 games.
+
+**Fix — per-game WOPR plus separate Availability.** Restricting the share calculation to **appeared-in games** (DEF-row team targets/air yards per game, then mean WOPR across those games) moved Nabers **0.2065 → 0.7904** (+0.10 above rank-1 median), Rice **0.3151 → 0.6091**, Wilson **0.4384 → 0.9727**. Availability split out as its own raw term: `(WR_PROJ_GAMES − games_played_2025) / GAMES_NORMALIZER`. Verification that the split was worthwhile: pairwise correlation between the three z-scored components **|r| < 0.03** (n=66) — effectively orthogonal.
+
+**Implementation bug (post-spec).** `_build_team_game_stats` initially iterated `context.players`, which excludes DEF rows (draft pool is QB/RB/WR/TE/K only). WOPR_pg resolved to 0 for every WR, inflating Role Shift uniformly. Fixed by resolving team per-game volume via `_get_def_player_by_team` + `season_games_by_player` (same method as diagnostics).
+
+**Empirical work — method and result:**
+
+| Work | Method | Result | Status |
+|---|---|---|---|
+| TD-per-target persistence | Odd/even 2025 split (n=78) | Pearson r=+0.0399, r²=0.0016, Spearman −0.0125. Control (targets/game): r²=0.6975, Spearman +0.8230 | **No YoY signal** — shrunken-rate model (k=120) worst option tested, losing to flat league mean both directions (1.5865 vs 1.5382; 1.6197 vs 1.5666). Removed from WR path |
+| β_tgt / β_ay grid search | Odd→even and even→odd RMSE | Best odd→even (0.0300, 0.0018); best even→odd (0.0380, 0.0016). β_tgt swings 27% across directions on flat RMSE surface | **FITTED — not sharply identified**; midpoint **0.034** / **0.0017** chosen. Two-term beats targets-only narrowly (Dir A: 1.5414 vs 1.5489). Caveat: two-term only ties flat league-mean baseline in Dir A (1.5414 vs 1.5382), wins clearly in Dir B (1.4928 vs 1.5666) |
+| WOPR per-game shrinkage k | Grid k=0–12, odd/even RMSE | Best odd→even k=1.5 (RMSE 0.1090); best even→odd k=3.0 (0.0901). Both beat k=0 (0.1149) | **FITTED — not sharply identified**; **k=2.5** midpoint chosen. Effect mild (Wilson 0.9727→0.9220, McLaurin 1.0656→1.0161) — per-game WOPR more predictive on small samples than assumed |
+| Rank medians (per-game WOPR) | 2025 medians by depth_chart_rank, ≥4 GP | {1: 0.6856, 2: 0.5017, 3: 0.3306, 4: 0.2078}, default 0.1387 rank 5+ / null. n = 30 / 26 / 23 / 22 / 71 | **FITTED** |
+| Δ weight sweep | Sets A–F (six splits summing to 1.0), λ=8.0 | Board highly weight-insensitive — max rank_spread 5, 20 of 31 players within 2 spots | **HAND-SET** — **0.20 / 0.50 / 0.30** (Set C). Set D (0.44/0.56/0.00, availability off) rejected: highest movement; only set where Wilson and Rice fall on games-missed artifacts — control confirming Availability earns its place. Set F (xTD-led) rejected: leans on weakest-identified term. Ordering by empirical support: Role (WOPR persists r²≈0.70) > Availability (hard count) > xTD (two loosely-identified coefficients) |
+| λ_WR sweep | {2, 3, 4, 5, 6, 8} at Set C weights | 26 of 30 players rank_spread ≤2; only JSN and Lamb λ-sensitive. λ=2 too timid (max move 2). λ=8 reorders elite tier (Lamb #1 past Nacua/Chase, JSN to #8) | **HAND-SET — λ_WR = 4.0**. Mean \|Move\| 0.92, 7 players move ≥3, every top-8-ADP WR within 3 of ADP. Explicitly lower than RB (8.0) and QB (8.0): WR ADP is densest, so a given Δ moves more rank spots, and WR signal rests on weaker identification |
+
+**Committed constants (WR DPS path):**
+
+| Constant | Value | Status |
+|---|---|---|
+| `WR_BETA_TGT` | 0.034 | FITTED — not sharply identified (odd 0.030 / even 0.038) |
+| `WR_BETA_AY` | 0.0017 | FITTED — not sharply identified (odd 0.0018 / even 0.0016) |
+| `WR_WOPR_SHRINK_K` | 2.5 | FITTED — not sharply identified (odd k=1.5 / even k=3.0, flat curve) |
+| `WR_WOPR_PG_MEDIAN` | 0.6856 / 0.5017 / 0.3306 / 0.2078 | FITTED (2025 medians, ≥4 GP) |
+| `WR_WOPR_PG_DEFAULT` | 0.1387 | FITTED (rank 5+ / null) |
+| `WR_PROJ_GAMES` | 17.0 | HAND-SET — flat across ranks |
+| `DELTA_WR_XTD_WEIGHT` | 0.20 | HAND-SET (Set C sweep) |
+| `DELTA_WR_ROLE_WEIGHT` | 0.50 | HAND-SET (Set C sweep) |
+| `DELTA_WR_AVAIL_WEIGHT` | 0.30 | HAND-SET (Set C sweep) |
+| `LAMBDA_WR` | 4.0 | HAND-SET (λ sweep) |
+
+**Formula (committed):**
+
+```
+xTD_Delta    = 0.034×targets + 0.0017×air_yards − rec_tds
+WOPR_pg      = mean over appeared-in games of [1.5×(tgt/team_tgt) + 0.7×(air/team_air)]
+shrunk_WOPR  = (GP×WOPR_pg + 2.5×rank_median) / (GP + 2.5)
+Role_Shift   = (rank_median − shrunk_WOPR) × context_multiplier
+Availability = (17 − GP_2025) / 16
+Delta_WR     = 0.20×Z_xTD + 0.50×Z_Role + 0.30×Z_Avail
+DPS          = ADP − (4.0 × Delta_WR)
+```
+
+**Verification anchor (λ=4, weights 0.20/0.50/0.30):** Nacua DPS#1, Chase #2, Lamb #3 (+3), JSN #6 (−3). Z_Role: Nacua −0.38, Chase −0.79, Lamb +0.24, JSN −2.21.
+
+**Open items carried forward (WR):**
+
+1. **Availability rewards missed games unconditionally** — no injury-history data to distinguish fluke from chronic absence.
+2. **xTD blind to offseason target competition** — e.g. Lamb's TD-luck rebound projected without regard to Pickens' arrival in the receiving corps.
+3. **`WR_PROJ_GAMES` flat at 17 across depth ranks** — Availability is a pure games-missed count, not a depth-chart games expectation like QB.
+4. **WR DPS remains read-only** in `draft_priority_review.py` — production `edge_scores` write still on legacy projected-points path pending TE/K/DST specs.
+5. **WR is not a drop-in template for TE** — TE target shares are much lower, TE1-vs-TE2 role separation is sharper, and n per depth rank will be thinner; first TE question is whether to inherit WR wholesale or design separately.
+
 **STILL OPEN (do not mark resolved):**
 1. QB pass-attempt inflation. Lamar projects 415.8 attempts vs 302 actual (ratio 1.377) because `season_regressed_stat`'s distance-penalty term shrinks archetypally-low-volume passers toward the QB baseline, treating "run-first QB" as if it were small-sample noise. This is why DE# ranks him QB15. Affects projected_points, not DPS.
 2. `proj_games` flat 16 for every QB1 (depth-chart derived, ignores 2025 availability). Same root limitation as the parked Murray low-sample note.
 3. All DPS weights (0.44/0.56) and lambdas remain hand-set, flagged for empirical fit.
-4. WR/TE/K Draft Edge not yet reviewed (RB reviewed — see ### RB above).
+4. TE/K Draft Edge not yet reviewed under DPS architecture (WR reviewed — see ### WR above).
 
 ---
 
