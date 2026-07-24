@@ -6,14 +6,14 @@
 |---|---|---|
 | QB | **Finalized and committed** | Not yet — DPS is read-only |
 | RB | **Finalized and committed** | Not yet — DPS is read-only |
-| WR | Not designed under this architecture | Legacy projected-points path |
+| WR | **Finalized and committed** | Legacy projected-points path |
 | TE | Not designed under this architecture | Legacy projected-points path |
 | K | Not designed under this architecture | Legacy projected-points path |
 | DST | Not designed under this architecture | Legacy projected-points path |
 
 **Implementation (read-only prototype):** `scoring/draft_priority_review.py` — computes and prints DPS boards; **does not write** to `edge_scores` or any table.
 
-**Legacy reference:** `edge_formula_nfl.md` and `scoring/compute_draft_edge.py` still describe the original **projected-points** Draft Edge ranking (season-long fantasy point totals from 2025 stats). That path remains live in code for WR/TE/K and is still used for weekly Edge. It is **superseded for Draft Edge purposes** by this document for QB and RB.
+**Legacy reference:** `edge_formula_nfl.md` and `scoring/compute_draft_edge.py` still describe the original **projected-points** Draft Edge ranking (season-long fantasy point totals from 2025 stats). That path remains live in code for WR/TE/K production writes and is still used for weekly Edge. It is **superseded for Draft Edge purposes** by this document for QB, RB, and WR.
 
 ---
 
@@ -32,7 +32,7 @@ Examples from the legacy path: Lamar Jackson ranked QB15, Matthew Stafford QB2.
 
 **Design pivot:** Market ADP (FFC 12-team full PPR) is the baseline **price**. The model only adjusts pick position where consensus is plausibly blind — specifically where 2025 counting stats and current depth-chart role imply mispricing of **touchdown luck (xTD)** and **role/opportunity (Role Shift)** relative to peers at the same position.
 
-Projected fantasy points remain useful for weekly Edge and for legacy Draft Edge positions; they are **not** the Draft Edge rank for QB/RB under this spec.
+Projected fantasy points remain useful for weekly Edge and for legacy Draft Edge production writes; they are **not** the Draft Edge rank for QB/RB/WR under this spec.
 
 ---
 
@@ -205,6 +205,95 @@ Positive Role Shift → model expects **higher** WO share in 2026 than 2025 usag
 
 ---
 
+## Position spec: WR
+
+**`lambda_WR = 4.0`**
+
+WR is the first position under this architecture with a **three-term** `Delta` and a **pure-opportunity xTD** model with **no player TD rate**. Both departures are data-driven — WR is not a drop-in template for TE (see Not yet done).
+
+### xTD (pure opportunity — no player TD rate)
+
+WR **does not** use `regressed_rate` / shrunken player TD-per-target. Odd/even 2025 validation showed **zero year-over-year persistence** for WR TD-per-target (Spearman **−0.0125**, r² **= 0.0016**). Targets-per-game control, by contrast, persists strongly (r² **= 0.6975**). xTD is therefore a volume-only expectation:
+
+```
+xTD_Delta = (WR_BETA_TGT × targets_2025)
+          + (WR_BETA_AY × receiving_air_yards_2025)
+          − receiving_tds_2025
+```
+
+Positive `xTD_Delta` → scored **fewer** receiving TDs than the opportunity model expected (unlucky) → model bumps draft priority.
+
+The legacy WR/TE shrunk rec-TD path (`SEASON_TD_RATE_K["wr_te_rec_td"]`) remains in code for **TE only**; WR no longer calls it in `draft_priority_review.py`.
+
+### Role Shift (shrunk per-game WOPR vs depth-rank median)
+
+Replaces v1 **season target-share** Role Shift (`WR_TARGET_SHARE_PRIOR`). Role is measured as weighted opportunity share **per game**, restricted to games the player appeared in, then shrunk toward a depth-rank prior.
+
+**Per-game WOPR** (exact per-game team restriction — not a season-total ratio):
+
+For each 2025 game row where the player has stats, using that game's DEF-row team targets and air yards:
+
+```
+WOPR_game = 1.5 × (player_targets / team_targets_that_game)
+          + 0.7 × (player_air_yards / team_air_yards_that_game)
+
+WOPR_pg = mean(WOPR_game) over appeared-in games
+```
+
+**Shrinkage toward rank median:**
+
+```
+shrunk_WOPR_pg = (GP × WOPR_pg + WR_WOPR_SHRINK_K × WR_WOPR_PG_MEDIAN[rank])
+               / (GP + WR_WOPR_SHRINK_K)
+
+Role_Shift = (WR_WOPR_PG_MEDIAN[rank] − shrunk_WOPR_pg) × context_multiplier
+```
+
+**`WR_WOPR_PG_MEDIAN`** (depth_chart_rank → median per-game WOPR, 2025, ≥ 4 GP):
+
+| Rank | Median |
+|---|---|
+| 1 | 0.6856 |
+| 2 | 0.5017 |
+| 3 | 0.3306 |
+| 4 | 0.2078 |
+| 5+ / null | 0.1387 (`WR_WOPR_PG_DEFAULT`) |
+
+Positive Role Shift → model expects **higher** per-game WOPR in 2026 than 2025 usage implied (under-utilized vs depth-chart prior).
+
+### Availability (games missed)
+
+Per-game WOPR conflates **role quality** with **games played** — a WR who missed games looks artificially low on WOPR_pg even if role per active game was strong. Availability is split out as a third raw component:
+
+```
+Availability = (WR_PROJ_GAMES − games_played_2025) / GAMES_NORMALIZER
+```
+
+- `WR_PROJ_GAMES = 17.0` — flat across depth ranks (WR2/WR3 play full seasons; no rank-tier prior like QB).
+- `GAMES_NORMALIZER = 16.0` — shared with QB/RB.
+
+Positive Availability → model expects **more** 2026 games than 2025 (missed time in 2025).
+
+### Three-term Delta (unlike QB/RB)
+
+QB/RB use two components at **0.44 / 0.56**. WR uses three z-scored components at **0.20 / 0.50 / 0.30**:
+
+```
+Delta_WR = 0.20 × Z_xTD + 0.50 × Z_Role + 0.30 × Z_Avail
+```
+
+**Why three terms:** per-game WOPR alone mixed role signal with availability; splitting Availability avoids penalizing high-per-game WOPR players who simply missed games. A weight sweep (Sets A–F) at `lambda_WR = 8.0` selected **Set C** (xTD-down, role-led). The three raw components are **near-orthogonal** in the 2025 z-sample (pairwise |r| **< 0.03**, n = 66), so the split is stable rather than double-counting.
+
+Z-scoring rules unchanged: population μ/σ within WR, 2025-data sample only; σ = 0 → z = 0.
+
+### WR lambda selection
+
+**2 / 3 / 4 / 5 / 6 / 8** sweep at Set C weights: WR ADP is denser than QB — same `Delta` moves more rank spots at higher lambda. **4.0** keeps the elite tier intact (only JSN / Lamb λ-sensitive); **8.0** over-promotes Lamb and distorts JSN. At λ = 4: mean |Move| ≈ 0.92, max |Move| = 5, n_move ≥ 5 = 1.
+
+Prototype board at λ = 4 (Set C): Nacua DPS#1, Chase #2, Lamb #3 (+3), JSN #6 (−3) — matches the sweep.
+
+---
+
 ## Shared definitions
 
 **Primary 2025 team**
@@ -242,7 +331,16 @@ DEF-row season totals (`player_game_stats` for each team's DEF player) provide t
 | `DELTA_ROLE_WEIGHT` | 0.56 | Hand-set (complement of 0.44) | **HAND-SET** |
 | `lambda_QB` | 8.0 | 4/8/12 sweep; minimal QB reordering at any value | **HAND-SET** |
 | `lambda_RB` | 8.0 | 3/5/8/12 sweep; stable signal, elite tier intact at 8 | **HAND-SET** |
-| `lambda_WR` | 8.0 | Not applied (WR still legacy) | **HAND-SET** (unused in DPS v1) |
+| `lambda_WR` | 4.0 | 2/3/4/5/6/8 sweep (Set C weights); elite tier intact; JSN/Lamb λ-sensitive | **HAND-SET** |
+| `WR_BETA_TGT` | 0.034 | Opportunity xTD target coefficient | **FITTED — not sharply identified** (odd 0.030 / even 0.038) |
+| `WR_BETA_AY` | 0.0017 | Opportunity xTD air-yards coefficient | **FITTED — not sharply identified** (odd 0.0018 / even 0.0016) |
+| `WR_WOPR_SHRINK_K` | 2.5 | WOPR_pg shrinkage toward rank median | **FITTED — not sharply identified** (odd k=1.5 / even k=3.0, flat curve) |
+| `WR_WOPR_PG_MEDIAN` | 0.6856 / 0.5017 / 0.3306 / 0.2078 | 2025 median per-game WOPR by depth rank (≥ 4 GP) | **FITTED** |
+| `WR_WOPR_PG_DEFAULT` | 0.1387 | Rank 5+ / null WOPR prior | **FITTED** |
+| `WR_PROJ_GAMES` | 17.0 | Flat projected games for Availability | **HAND-SET** |
+| `DELTA_WR_XTD_WEIGHT` | 0.20 | WR three-way Δ split (Set C sweep) | **HAND-SET** |
+| `DELTA_WR_ROLE_WEIGHT` | 0.50 | WR three-way Δ split (Set C sweep) | **HAND-SET** |
+| `DELTA_WR_AVAIL_WEIGHT` | 0.30 | WR three-way Δ split (Set C sweep) | **HAND-SET** |
 | `lambda_TE` | 6.0 | Not applied (TE still legacy) | **HAND-SET** (unused in DPS v1) |
 | `context_multiplier` | 0.85 | Hand-set discount on role shift after team change | **HAND-SET** |
 | `GAMES_NORMALIZER` | 16.0 | NFL regular-season games scale | **HAND-SET** |
@@ -270,15 +368,21 @@ DEF-row season totals (`player_game_stats` for each team's DEF player) provide t
 
 5. **No 2026 market / Vegas features** — no odds or game-script data exists this far before the season; not in DPS v1.
 
-6. **Legacy projected-points Draft Edge still runs for WR/TE/K** — cross-position comparability with QB/RB DPS does not exist yet.
+6. **Legacy projected-points Draft Edge still runs for WR/TE/K production writes** — WR DPS spec is committed in the read-only prototype, but `compute_draft_edge.py` has not switched; cross-position comparability with QB/RB/WR DPS does not exist yet.
 
 7. **QB Role Shift uses flat 16 games for QB1** — ignores 2025 injury/availability history except via `games_played_2025`.
+
+8. **WR Availability rewards missed games unconditionally** — no distinction between fluke and chronic injury; no injury-history data. Any 2025 games missed increase Availability equally.
+
+9. **WR xTD cannot see offseason target competition** — a WR1's TD-luck rebound is projected without regard to a new arrival in the receiving corps (e.g. vacated or competing targets invisible to the opportunity model).
+
+10. **WR `proj_games` is flat 17 across depth ranks** — Availability is a pure games-missed count, not a depth-chart games expectation like QB.
 
 ---
 
 ## Not yet done
 
-- [ ] WR, TE, K, DST position specs under DPS architecture
+- [ ] TE, K, DST position specs under DPS architecture
 - [ ] Write DPS to `edge_scores` as production `draft_edge` ranking (`score_type='draft_edge'`, `positional_rank`)
 - [ ] Cross-position overall draft rank (single ordered board)
 - [ ] Empirical fit of `DELTA` weights (0.44/0.56) and `context_multiplier`
@@ -303,6 +407,6 @@ DEF-row season totals (`player_game_stats` for each team's DEF player) provide t
 
 ## Related documents
 
-- **Weekly Edge / shared projection math:** `edge_formula_nfl.md` (authoritative for weekly Edge; legacy Draft Edge for non-QB/RB)
-- **Calibration log:** `PROJECT_LOG.md` Phase 5.1 (QB + RB)
+- **Weekly Edge / shared projection math:** `edge_formula_nfl.md` (authoritative for weekly Edge; legacy projected-points production writes for WR/TE/K)
+- **Calibration log:** `PROJECT_LOG.md` Phase 5.1 (QB + RB + WR)
 - **Legacy Draft Edge writer:** `scoring/compute_draft_edge.py` (projected points → `edge_scores`)
