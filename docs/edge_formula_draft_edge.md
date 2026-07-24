@@ -7,13 +7,13 @@
 | QB | **Finalized and committed** | Not yet — DPS is read-only |
 | RB | **Finalized and committed** | Not yet — DPS is read-only |
 | WR | **Finalized and committed** | Legacy projected-points path |
-| TE | Not designed under this architecture | Legacy projected-points path |
+| TE | **Finalized — no adjustment (Δ = 0)** | Legacy projected-points path |
 | K | Not designed under this architecture | Legacy projected-points path |
 | DST | Not designed under this architecture | Legacy projected-points path |
 
 **Implementation (read-only prototype):** `scoring/draft_priority_review.py` — computes and prints DPS boards; **does not write** to `edge_scores` or any table.
 
-**Legacy reference:** `edge_formula_nfl.md` and `scoring/compute_draft_edge.py` still describe the original **projected-points** Draft Edge ranking (season-long fantasy point totals from 2025 stats). That path remains live in code for WR/TE/K production writes and is still used for weekly Edge. It is **superseded for Draft Edge purposes** by this document for QB, RB, and WR.
+**Legacy reference:** `edge_formula_nfl.md` and `scoring/compute_draft_edge.py` still describe the original **projected-points** Draft Edge ranking (season-long fantasy point totals from 2025 stats). That path remains live in code for WR/TE/K production writes and is still used for weekly Edge. It is **superseded for Draft Edge purposes** by this document for QB, RB, WR, and TE (TE as `DPS = ADP`).
 
 ---
 
@@ -32,7 +32,7 @@ Examples from the legacy path: Lamar Jackson ranked QB15, Matthew Stafford QB2.
 
 **Design pivot:** Market ADP (FFC 12-team full PPR) is the baseline **price**. The model only adjusts pick position where consensus is plausibly blind — specifically where 2025 counting stats and current depth-chart role imply mispricing of **touchdown luck (xTD)** and **role/opportunity (Role Shift)** relative to peers at the same position.
 
-Projected fantasy points remain useful for weekly Edge and for legacy Draft Edge production writes; they are **not** the Draft Edge rank for QB/RB/WR under this spec.
+Projected fantasy points remain useful for weekly Edge and for legacy Draft Edge production writes; they are **not** the Draft Edge rank for QB/RB/WR under this spec. TE under this spec is **pure ADP** (`Δ = 0`) — see Position spec: TE.
 
 ---
 
@@ -294,6 +294,60 @@ Prototype board at λ = 4 (Set C): Nacua DPS#1, Chase #2, Lamb #3 (+3), JSN #6 (
 
 ---
 
+## Position spec: TE
+
+```
+Δ_TE  = 0
+DPS_TE = ADP_TE
+```
+
+TE receives **no model adjustment** off market ADP. This is a deliberate, evidence-backed conclusion — not an unfinished position. `lambda_TE` is **not applied**.
+
+### Sample
+
+- **n = 23** TEs with an ADP row (vs **78** WR).
+- Draft pool **216** TEs; **97** with 2025 stats and ≥ 4 GP.
+
+### `depth_chart_rank` is unusable for TE
+
+All **32** teams show exactly one rank-1 and one rank-2 TE — mechanical reseed assignment, not football. Every TE in the top 25 by Draft Edge (legacy projected-points) rank reads `dc_rank = 1`, including Isaiah Likely (36 targets) and Cade Otton. Rank-3 and rank-4 per-game WOPR medians are inverted (**0.0812** vs **0.0925**). Role Shift in the `rank_median − actual` form has **no valid baseline**.
+
+### Unmeasurable mechanisms
+
+The plausible TE-specific TD drivers — **red-zone role** and **snap alignment** (inline vs slot/wide) — are absent from the stats JSONB. Only `targets` and `target_share` are available among target-related keys; **no red-zone-like keys** exist across **3,362** scanned game rows (TE+WR). Flagged for revisit if a data source providing these is added.
+
+### Pooled WR+TE opportunity fit failed
+
+Odd/even 2025 split, **n = 112** (WR **79** / TE **33**), ≥ 20 targets both halves. Directions disagree materially:
+
+| Direction | Best `(β_tgt, β_ay)` |
+|---|---|
+| odd → even | **(0.054, 0.0000)** |
+| even → odd | **(0.038, 0.0016)** |
+
+Direction A wants the air-yards term at zero — i.e. a different model. At the selected midpoint **(0.046, 0.0008)**, TEs are systematically under-predicted on the odd holdout: TE mean residual **−0.62** vs WR **+0.22**, ratio to pooled stdev **0.55**. Pooling averaged over a position effect rather than absorbing it.
+
+### TE-only shrunken rate lost to baselines
+
+TE TD-per-target showed **apparent** persistence (odd/even r² **= 0.1184**, Spearman **0.346**, n **= 33**) against WR's r² **= 0.0039** in the same run — but a shrunken player rate failed the out-of-sample gate:
+
+| Direction | Best k (RMSE) | Shrunken RMSE | vs opportunity (WR stored / pooled) | vs flat TE mean |
+|---|---|---|---|---|
+| odd → even | k = 260 | 1.5964 | **loses** (1.5229 / 1.5239) | beats (1.6034) |
+| even → odd | k = 400 | 1.5331 | beats (1.7776 / 1.6513) | **loses** (1.5323) |
+
+Dir B improves monotonically to the grid endpoint (k = 400) — i.e. asks for the **league mean with no player rate**. Midpoint k = 330 fails in both directions. Best-RMSE and best-Spearman k disagree in both directions (**260 vs 0**; **400 vs 70**). **Not sharply identified; loses to the baseline.**
+
+### The apparent persistence was one player
+
+Leave-one-out on the worst residual (**Trey McBride**, both directions) moves the fitted k from **260 → 50** (Dir A) and **400 → 80** (Dir B) — a **4–5×** swing from removing one of 33. The r² = 0.1184 reflected high-volume TEs scoring more TDs, not stable per-target conversion skill.
+
+### Availability alone was rejected
+
+A one-term `Δ = Z_Avail` would rank TEs purely by 2025 games missed — an injury list, not a draft board — and inherits the durability-penalty asymmetry with no offsetting signal.
+
+---
+
 ## Shared definitions
 
 **Primary 2025 team**
@@ -341,7 +395,10 @@ DEF-row season totals (`player_game_stats` for each team's DEF player) provide t
 | `DELTA_WR_XTD_WEIGHT` | 0.20 | WR three-way Δ split (Set C sweep) | **HAND-SET** |
 | `DELTA_WR_ROLE_WEIGHT` | 0.50 | WR three-way Δ split (Set C sweep) | **HAND-SET** |
 | `DELTA_WR_AVAIL_WEIGHT` | 0.30 | WR three-way Δ split (Set C sweep) | **HAND-SET** |
-| `lambda_TE` | 6.0 | Not applied (TE still legacy) | **HAND-SET** (unused in DPS v1) |
+| `Δ_TE` / `DPS_TE` | `0` / `ADP_TE` | Task 2 head-to-head: shrunken rate loses gate both directions (Dir A 1.5964 vs opp 1.5229/1.5239; Dir B 1.5331 vs flat 1.5323); pooled opp unidentified; Role Shift baseline unusable | **VALIDATED — no usable signal** |
+| `lambda_TE` | not applied (`Δ = 0`) | Placeholder 6.0 never used; TE is pure ADP | **N/A** |
+| TE shrunken k (rejected) | — | Odd/even n=33; best-RMSE k 260 vs 400 disagree; Dir A loses to opportunity (1.5964 vs 1.5229/1.5239); Dir B loses to flat TE mean (1.5331 vs 1.5323); LOO on McBride swings k 4–5× | **REJECTED — no usable signal** |
+| TE pooled `(β_tgt, β_ay)` (rejected) | — | n=112 (WR 79 / TE 33); directions 0.054/0.0000 vs 0.038/0.0016; TE odd-holdout mean residual −0.62 vs WR +0.22 | **REJECTED — not identified / masks position effect** |
 | `context_multiplier` | 0.85 | Hand-set discount on role shift after team change | **HAND-SET** |
 | `GAMES_NORMALIZER` | 16.0 | NFL regular-season games scale | **HAND-SET** |
 | `SEASON_TD_RATE_K["qb_pass_td"]` | 300 | Odd/even 2025 split (n=33); RMSE min in 300–400 band; chronological splits disagree | **VALIDATED — not sharply identified** |
@@ -368,7 +425,7 @@ DEF-row season totals (`player_game_stats` for each team's DEF player) provide t
 
 5. **No 2026 market / Vegas features** — no odds or game-script data exists this far before the season; not in DPS v1.
 
-6. **Legacy projected-points Draft Edge still runs for WR/TE/K production writes** — WR DPS spec is committed in the read-only prototype, but `compute_draft_edge.py` has not switched; cross-position comparability with QB/RB/WR DPS does not exist yet.
+6. **Legacy projected-points Draft Edge still runs for WR/TE/K production writes** — WR DPS and TE `Δ = 0` are committed in the read-only prototype / this spec, but `compute_draft_edge.py` has not switched; cross-position comparability with QB/RB/WR/TE DPS does not exist yet.
 
 7. **QB Role Shift uses flat 16 games for QB1** — ignores 2025 injury/availability history except via `games_played_2025`.
 
@@ -378,11 +435,13 @@ DEF-row season totals (`player_game_stats` for each team's DEF player) provide t
 
 10. **WR `proj_games` is flat 17 across depth ranks** — Availability is a pure games-missed count, not a depth-chart games expectation like QB.
 
+11. **TE is anchored fully to market ADP** — any TE mispricing the market carries through unchanged (`Δ_TE = 0`). Revisit if red-zone or snap-alignment data becomes available, or if the ADP-eligible TE pool grows materially.
+
 ---
 
 ## Not yet done
 
-- [ ] TE, K, DST position specs under DPS architecture
+- [ ] K, DST position specs under DPS architecture
 - [ ] Write DPS to `edge_scores` as production `draft_edge` ranking (`score_type='draft_edge'`, `positional_rank`)
 - [ ] Cross-position overall draft rank (single ordered board)
 - [ ] Empirical fit of `DELTA` weights (0.44/0.56) and `context_multiplier`
@@ -408,5 +467,5 @@ DEF-row season totals (`player_game_stats` for each team's DEF player) provide t
 ## Related documents
 
 - **Weekly Edge / shared projection math:** `edge_formula_nfl.md` (authoritative for weekly Edge; legacy projected-points production writes for WR/TE/K)
-- **Calibration log:** `PROJECT_LOG.md` Phase 5.1 (QB + RB + WR)
+- **Calibration log:** `PROJECT_LOG.md` Phase 5.1 (QB + RB + WR + TE)
 - **Legacy Draft Edge writer:** `scoring/compute_draft_edge.py` (projected points → `edge_scores`)
