@@ -1,33 +1,22 @@
 """
 Draft Edge orchestration layer.
 
-Season-long positional rankings for the upcoming draft, built from the SAME
-opportunity/efficiency/shrinkage engine as weekly Edge (season_stats.py +
-draft_edge_features.py reuse scoring/stats_utils.py's regressed_rate, and
-points_calculator.py's existing calculate_*_points functions), but
-re-weighted for season-long context per edge_formula_nfl.md: no per-week
-matchup factor (there's no specific week to matchup against), scarcity and
-ADP value gap instead.
+Season-long positional rankings for the upcoming draft via the Draft Priority
+Score (DPS) architecture (docs/edge_formula_draft_edge.md):
 
-Deliberately separate from compute_edge_scores.py -- this is NOT a trailing
-EWMA over recent games (there are no 2026 games yet to trail). It projects
-each player's 2026 role from their 2025 SEASON totals, adjusted by their
-CURRENT depth-chart context. Does not import or call `_get_upcoming_game`
-/ `_get_game_for_period` -- there is no game being targeted here.
+  DPS = ADP − (λ_pos × Δ)
 
-Scope (see PROJECT_LOG.md Phase 5): QB/RB/WR/TE/K only. DST intentionally
-excluded -- out of scope per this session's task boundaries (dst_features.py/
-points_calculator.py's DST logic is untouched). vegas_features.py, weekly
-Edge, and Wire Edge are also untouched; no 2026 odds data exists this far
-before the season, so there's no market-blend feature to add here yet
-(expected, not a gap -- see edge_formula_nfl.md's Vegas-features section,
-which only ever applied at the per-game level anyway).
+QB/RB/WR use the settled model Δ from scoring/draft_priority_score.py.
+TE/K/DST (players.position == 'DEF') are finalized as Δ = 0 (DPS = ADP).
 
 Writes to `edge_scores` with score_type='draft_edge'. Per the schema's
 Draft Edge column comment, this is RANK-based, not a /100 score:
 `score_value` is left null and `positional_rank` is populated. Reuses the
 same UNIQUE(player_id, score_type, period) upsert path added in Phase 4.7
 -- no schema change needed.
+
+Population: players with an ADP row only. Legacy projected-points path is
+superseded for this write; weekly Edge / Wire Edge are untouched.
 """
 
 from __future__ import annotations
@@ -36,6 +25,21 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from config.supabase_client import get_supabase_client
+from scoring.draft_priority_score import (
+    MODEL_POSITIONS,
+    NO_ADJUSTMENT_POSITIONS,
+    PRODUCTION_POSITIONS,
+    _apply_z_scores_and_dps,
+    _build_no_adjustment_records,
+    _build_player_records,
+    _build_team_game_stats,
+    _build_team_targets_by_team,
+    _derive_w_target,
+    _rank_by_adp,
+    _rank_by_dps,
+    _rank_overall_by_dps,
+    build_factor_breakdown,
+)
 from scoring.season_stats import (
     MIN_SEASON_GAMES,
     aggregate_skill_season_totals,
@@ -418,87 +422,366 @@ def compute_draft_edge_projections(
     return players, all_projections, adp_by_player
 
 
+def _fetch_def_players(client) -> list[dict]:
+    """DST rows live as players.position == 'DEF'."""
+    result = (
+        client.table("players")
+        .select("player_id, full_name, position, team_id, depth_chart_rank")
+        .eq("sport", "nfl")
+        .eq("position", "DEF")
+        .execute()
+    )
+    return result.data or []
+
+
+def _count_draft_edge_rows(client) -> int:
+    total = 0
+    offset = 0
+    while True:
+        result = (
+            client.table("edge_scores")
+            .select("player_id")
+            .eq("score_type", SCORE_TYPE)
+            .eq("period", PERIOD)
+            .range(offset, offset + PAGE_SIZE - 1)
+            .execute()
+        )
+        batch = result.data or []
+        total += len(batch)
+        if len(batch) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+    return total
+
+
+def _fetch_draft_edge_player_ids(client) -> set[str]:
+    ids: set[str] = set()
+    offset = 0
+    while True:
+        result = (
+            client.table("edge_scores")
+            .select("player_id")
+            .eq("score_type", SCORE_TYPE)
+            .eq("period", PERIOD)
+            .range(offset, offset + PAGE_SIZE - 1)
+            .execute()
+        )
+        batch = result.data or []
+        for row in batch:
+            ids.add(row["player_id"])
+        if len(batch) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+    return ids
+
+
+def compute_production_dps_records(client) -> tuple[list[dict], dict]:
+    """
+    Build production DPS records for all ADP-eligible players.
+    Returns (records, meta) where meta holds sample sizes / exclusion counts.
+    """
+    context = load_draft_edge_context(client)
+    def_players = _fetch_def_players(client)
+    def_player_by_team = _get_def_player_by_team(client)
+
+    # Merge DEF into a combined player list for no-adjustment path.
+    # Context.players already has QB/RB/WR/TE/K.
+    all_players_by_id = {p["player_id"]: p for p in context.players}
+    for p in def_players:
+        all_players_by_id[p["player_id"]] = p
+    all_players = list(all_players_by_id.values())
+
+    team_targets_by_team = _build_team_targets_by_team(
+        context.season_games_by_player, def_player_by_team,
+    )
+    team_game_stats = _build_team_game_stats(
+        context.season_games_by_player, def_player_by_team,
+    )
+    ppc, ppt, w_target, w_target_rb_n = _derive_w_target(context)
+
+    print(f"ADP players (latest per player_id): n={len(context.adp_by_player)}")
+    print(f"Draft-pool skill players loaded: n={len(context.players)}")
+    print(f"DEF players loaded: n={len(def_players)}")
+    print(f"RB W_TARGET (derived): {w_target:.4f}  (n_rb>=50 carries: {w_target_rb_n})")
+    print(f"  points/carry={ppc:.4f}  points/target={ppt:.4f}")
+
+    model_records, excl_model, no_data_model, missing_model = _build_player_records(
+        context,
+        w_target=w_target,
+        team_targets_by_team=team_targets_by_team,
+        team_game_stats=team_game_stats,
+        positions=MODEL_POSITIONS,
+    )
+    print(f"Model positions (QB/RB/WR) with ADP: n={len(model_records)}")
+    print(f"  excluded (in pool, no ADP): n={excl_model}")
+    print(f"  no_2025_data: { {k: no_data_model.get(k, 0) for k in MODEL_POSITIONS} }")
+
+    no_adj_records, excl_no_adj, no_data_no_adj, missing_no_adj = _build_no_adjustment_records(
+        all_players,
+        context.adp_by_player,
+        context.season_games_by_player,
+        positions=NO_ADJUSTMENT_POSITIONS,
+    )
+    print(f"No-adjustment positions (TE/K/DEF) with ADP: n={len(no_adj_records)}")
+    print(f"  excluded (in pool, no ADP): n={excl_no_adj}")
+    print(f"  no_2025_data: {dict(no_data_no_adj)}")
+
+    missing_inputs = missing_model + missing_no_adj
+    if missing_inputs:
+        print(f"Missing inputs substituted: n={len(missing_inputs)}")
+        for line in missing_inputs:
+            print(f"  {line}")
+    else:
+        print("Missing inputs substituted: n=0")
+
+    sample_sizes = _apply_z_scores_and_dps(model_records, positions=MODEL_POSITIONS)
+    records = model_records + no_adj_records
+    _rank_by_adp(records, positions=PRODUCTION_POSITIONS)
+    _rank_by_dps(records, positions=PRODUCTION_POSITIONS)
+    _rank_overall_by_dps(records)
+
+    meta = {
+        "w_target": w_target,
+        "w_target_rb_n": w_target_rb_n,
+        "sample_sizes": sample_sizes,
+        "n_model": len(model_records),
+        "n_no_adj": len(no_adj_records),
+        "n_total": len(records),
+        "adp_n": len(context.adp_by_player),
+    }
+    return records, meta
+
+
 def compute_and_write_draft_edge() -> None:
     client = get_supabase_client()
 
-    players, all_projections, adp_by_player = compute_draft_edge_projections()
+    existing_before = _count_draft_edge_rows(client)
+    print(f"Existing draft_edge rows for period={PERIOD}: n={existing_before}")
 
-    print(f"Draft pool: {len(players)} players across {DRAFT_POSITIONS}.")
-    real_count = sum(
-        1 for proj in all_projections.values()
-        if not proj["features"].get("no_historical_data")
-    )
-    print(f"Real (2025-history-based) projections: {real_count}. No-historical-data placeholders needed: {len(players) - real_count}.")
-    by_position: dict[str, list[str]] = {}
-    for pid, proj in all_projections.items():
-        by_position.setdefault(proj["position"], []).append(pid)
+    records, meta = compute_production_dps_records(client)
+    print(f"\nProduction DPS board size: n={meta['n_total']} "
+          f"(model={meta['n_model']}, no_adjustment={meta['n_no_adj']})")
 
-    rows_to_upsert = []
     computed_at = datetime.now(timezone.utc).isoformat()
+    rows_to_upsert = []
+    for rec in records:
+        rows_to_upsert.append({
+            "player_id": rec["player_id"],
+            "score_type": SCORE_TYPE,
+            "period": PERIOD,
+            "score_value": None,
+            "positional_rank": rec["dps_rank"],
+            "factor_breakdown": build_factor_breakdown(rec),
+            "computed_at": computed_at,
+        })
 
-    for position, pids in by_position.items():
-        sorted_by_points = sorted(pids, key=lambda pid: all_projections[pid]["points"], reverse=True)
-        n = len(sorted_by_points)
-
-        # Scarcity gaps use REAL projections only — ADP placeholders (no_historical_data)
-        # sit out of the chain so interpolated mid-tier points don't inject artificial
-        # near-zero gaps between their ranked neighbors. Placeholders get null scarcity.
-        real_sorted = [
-            pid for pid in sorted_by_points
-            if not all_projections[pid]["features"].get("no_historical_data")
-        ]
-        real_points = [all_projections[pid]["points"] for pid in real_sorted]
-        real_scarcity_by_pid: dict[str, float | None] = {}
-        for idx, pid in enumerate(real_sorted):
-            real_scarcity_by_pid[pid] = (
-                real_points[idx] - real_points[idx + 1] if idx + 1 < len(real_sorted) else 0.0
-            )
-
-        # ADP positional rank -- only among players who actually have an ADP.
-        pids_with_adp = [pid for pid in pids if adp_by_player.get(pid) is not None]
-        pids_with_adp.sort(key=lambda pid: adp_by_player[pid])
-        adp_rank_by_pid = {pid: rank + 1 for rank, pid in enumerate(pids_with_adp)}
-
-        for rank, pid in enumerate(sorted_by_points):
-            positional_rank = rank + 1
-            is_placeholder = all_projections[pid]["features"].get("no_historical_data")
-            scarcity = None if is_placeholder else real_scarcity_by_pid.get(pid)
-
-            adp_positional_rank = adp_rank_by_pid.get(pid)
-            adp_value_gap = (
-                positional_rank - adp_positional_rank if adp_positional_rank is not None else None
-            )
-
-            proj = all_projections[pid]
-            factor_breakdown = {
-                **proj["features"],
-                "projected_points": round(proj["points"], 2),
-                "scarcity_gap_to_next_rank": round(scarcity, 2) if scarcity is not None else None,
-                "adp_value": adp_by_player.get(pid),
-                "adp_positional_rank": adp_positional_rank,
-                # your_projected_positional_rank - adp_positional_rank (edge_formula_nfl.md /
-                # Task 4b). Positive: the market ranks this player BETTER than the model does
-                # (potential fade/overvalued-by-ADP). Negative: the model likes this player MORE
-                # than the market does (potential value/sleeper). Null: no ADP data for this player.
-                "adp_value_gap": adp_value_gap,
-            }
-
-            rows_to_upsert.append({
-                "player_id": pid,
-                "score_type": SCORE_TYPE,
-                "period": PERIOD,
-                "score_value": None,
-                "positional_rank": positional_rank,
-                "factor_breakdown": factor_breakdown,
-                "computed_at": computed_at,
-            })
+    written_ids = {r["player_id"] for r in rows_to_upsert}
 
     if rows_to_upsert:
-        client.table("edge_scores").upsert(
-            rows_to_upsert, on_conflict="player_id,score_type,period"
-        ).execute()
+        # Upsert in chunks to stay under payload limits.
+        chunk_size = 200
+        for i in range(0, len(rows_to_upsert), chunk_size):
+            chunk = rows_to_upsert[i:i + chunk_size]
+            client.table("edge_scores").upsert(
+                chunk, on_conflict="player_id,score_type,period"
+            ).execute()
 
-    print(f"Computed and wrote {len(rows_to_upsert)} draft_edge rows for period={PERIOD}.")
+    print(f"Upserted draft_edge rows: n={len(rows_to_upsert)}")
+
+    # Stale-row cleanup: delete legacy ADP-less (and any other) rows not in written set.
+    existing_ids = _fetch_draft_edge_player_ids(client)
+    stale_ids = sorted(existing_ids - written_ids)
+    print(f"Stale draft_edge player_ids to delete: n={len(stale_ids)}")
+
+    deleted_count = 0
+    if stale_ids:
+        chunk_size = 200
+        for i in range(0, len(stale_ids), chunk_size):
+            chunk = stale_ids[i:i + chunk_size]
+            result = (
+                client.table("edge_scores")
+                .delete()
+                .eq("score_type", SCORE_TYPE)
+                .eq("period", PERIOD)
+                .in_("player_id", chunk)
+                .execute()
+            )
+            # Prefer actual returned rows when available; else fall back to requested chunk
+            # and verify after.
+            returned = result.data or []
+            if returned:
+                deleted_count += len(returned)
+            else:
+                deleted_count += len(chunk)
+
+    # Verify deletes actually landed (Phase 3 game-seeding bug: do not trust pre-delete alone).
+    remaining_ids = _fetch_draft_edge_player_ids(client)
+    stale_remaining = remaining_ids - written_ids
+    if stale_remaining:
+        print(f"WARNING: stale rows still present after delete: n={len(stale_remaining)}")
+        # Retry once
+        retry = sorted(stale_remaining)
+        for i in range(0, len(retry), 200):
+            chunk = retry[i:i + 200]
+            client.table("edge_scores").delete().eq("score_type", SCORE_TYPE).eq(
+                "period", PERIOD
+            ).in_("player_id", chunk).execute()
+        remaining_ids = _fetch_draft_edge_player_ids(client)
+        stale_remaining = remaining_ids - written_ids
+        deleted_count = len(stale_ids)  # requested; verified below
+
+    actually_deleted = len(stale_ids) - len(stale_remaining)
+    print(f"Stale rows actually deleted: n={actually_deleted}")
+    if stale_remaining:
+        print(f"ERROR: {len(stale_remaining)} stale rows could not be deleted")
+
+    total_after = _count_draft_edge_rows(client)
+    print(f"Total draft_edge rows after cleanup: n={total_after}")
+
+    _print_dps_write_verification(client, records, meta, total_after, written_ids)
+
+
+def _print_dps_write_verification(
+    client,
+    records: list[dict],
+    meta: dict,
+    total_after: int,
+    written_ids: set[str],
+) -> None:
+    """Eight verification blocks required by the production-write prompt."""
+    from collections import Counter
+
+    # ---- 1. Rows written by position + total ----
+    print("\n" + "=" * 80)
+    print("VERIFICATION 1 — rows written by position")
+    by_pos = Counter(r["position"] for r in records)
+    for pos in PRODUCTION_POSITIONS:
+        print(f"  {pos}: n={by_pos.get(pos, 0)}")
+    print(f"  TOTAL written: n={len(records)}")
+
+    # ---- 2. Total rows after cleanup == written ----
+    print("\n" + "=" * 80)
+    print("VERIFICATION 2 — total rows for period after cleanup")
+    print(f"  total_rows period={PERIOD}: n={total_after}")
+    print(f"  rows written: n={len(records)}")
+    print(f"  match: {total_after == len(records)}")
+
+    # ---- 3. Upsert dedup ----
+    print("\n" + "=" * 80)
+    print("VERIFICATION 3 — upsert dedup (total_rows == distinct player_id)")
+    distinct_ids = _fetch_draft_edge_player_ids(client)
+    print(f"  total_rows: n={total_after}")
+    print(f"  distinct(player_id): n={len(distinct_ids)}")
+    print(f"  match: {total_after == len(distinct_ids)}")
+
+    # Reload factor_breakdown from DB for remaining checks
+    db_rows: list[dict] = []
+    offset = 0
+    while True:
+        result = (
+            client.table("edge_scores")
+            .select("player_id, positional_rank, score_value, factor_breakdown")
+            .eq("score_type", SCORE_TYPE)
+            .eq("period", PERIOD)
+            .range(offset, offset + PAGE_SIZE - 1)
+            .execute()
+        )
+        batch = result.data or []
+        db_rows.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+
+    by_id = {r["player_id"]: r for r in db_rows}
+    rec_by_id = {r["player_id"]: r for r in records}
+
+    # ---- 4. Top 15 overall ----
+    print("\n" + "=" * 80)
+    print("VERIFICATION 4 — top 15 by overall_rank")
+    top15 = sorted(records, key=lambda r: r["overall_rank"])[:15]
+    hdr = f"{'OVR':>3} | {'Pos':>3} | {'Player':<26} | {'ADP':>6} | {'DPS':>7} | {'Pos#':>4}"
+    print(hdr)
+    print("-" * len(hdr))
+    for r in top15:
+        print(
+            f"{r['overall_rank']:>3} | {r['position']:>3} | {r['name']:<26} | "
+            f"{r['adp']:>6.1f} | {r['dps']:>7.2f} | {r['dps_rank']:>4}"
+        )
+
+    # ---- 5. Top 10 per position ----
+    print("\n" + "=" * 80)
+    print("VERIFICATION 5 — top 10 per position by positional_rank")
+    for pos in PRODUCTION_POSITIONS:
+        group = sorted(
+            [r for r in records if r["position"] == pos],
+            key=lambda r: r["dps_rank"],
+        )[:10]
+        print(f"\n  {pos} (n_pos={by_pos.get(pos, 0)})")
+        if not group:
+            print("    (none)")
+            continue
+        for r in group:
+            print(
+                f"    #{r['dps_rank']:<2} {r['name']:<26} ADP={r['adp']:>6.1f}  "
+                f"DPS={r['dps']:>7.2f}  OVR={r['overall_rank']:>3}"
+            )
+
+    # ---- 6. WR verification anchor ----
+    print("\n" + "=" * 80)
+    print("VERIFICATION 6 — WR anchor (Nacua #1, Chase #2, Lamb #3, JSN #6)")
+    wr = {r["name"]: r for r in records if r["position"] == "WR"}
+    anchors = [
+        ("Puka Nacua", 1),
+        ("Ja'Marr Chase", 2),
+        ("CeeDee Lamb", 3),
+        ("Jaxon Smith-Njigba", 6),
+    ]
+    for name, expected in anchors:
+        rec = wr.get(name)
+        if not rec:
+            print(f"  {name}: NOT FOUND")
+            continue
+        ok = rec["dps_rank"] == expected
+        print(
+            f"  {name}: DPS#={rec['dps_rank']} expected={expected}  "
+            f"{'OK' if ok else 'MISMATCH'}  DPS={rec['dps']:.2f}"
+        )
+
+    # ---- 7. factor_breakdown null/empty count ----
+    print("\n" + "=" * 80)
+    print("VERIFICATION 7 — factor_breakdown null/empty count (must be 0)")
+    null_empty = 0
+    for row in db_rows:
+        fb = row.get("factor_breakdown")
+        if fb is None or fb == {} or fb == []:
+            null_empty += 1
+    print(f"  null/empty factor_breakdown: n={null_empty}")
+
+    # ---- 8. TE/K/DEF delta=0 and dps==adp ----
+    print("\n" + "=" * 80)
+    print("VERIFICATION 8 — TE/K/DEF delta=0 and dps==adp")
+    for pos in ("TE", "K", "DEF"):
+        group = [r for r in records if r["position"] == pos]
+        bad_delta = sum(1 for r in group if r["delta"] != 0.0)
+        bad_dps = sum(1 for r in group if abs(r["dps"] - r["adp"]) > 1e-9)
+        no_adj_flag = sum(1 for r in group if not r.get("no_adjustment"))
+        print(
+            f"  {pos}: n={len(group)}  delta!=0: {bad_delta}  "
+            f"dps!=adp: {bad_dps}  missing no_adjustment flag: {no_adj_flag}"
+        )
+        # Cross-check DB
+        db_bad = 0
+        for r in group:
+            row = by_id.get(r["player_id"])
+            if not row:
+                db_bad += 1
+                continue
+            fb = row.get("factor_breakdown") or {}
+            if fb.get("delta") != 0 or fb.get("dps") != fb.get("adp"):
+                db_bad += 1
+        print(f"    DB mismatches (delta!=0 or dps!=adp): n={db_bad}")
+
+    print("\nVERIFICATION COMPLETE")
 
 
 def find_player_by_name(players: list[dict], name: str) -> dict | None:
